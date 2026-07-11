@@ -1,315 +1,305 @@
+"""
+Textbook PDF Finder — Scrape & Open in Brave
+
+Scrapes educational websites for Google Drive PDF links,
+then opens them all in Brave browser at once.
+Use with the "Document Preview Exporter" extension to download view-only PDFs.
+
+Usage:
+    python downloader.py
+
+Dependencies:
+    pip install requests beautifulsoup4
+"""
+
 import re
+import os
+import sys
+import subprocess
+import concurrent.futures
 import requests
 from bs4 import BeautifulSoup
-import time
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-import os
-import glob
+from urllib.parse import urlparse, urljoin
 
-print("=" * 70)
-print("🚀 GOOGLE DRIVE FILE DOWNLOADER (FULLY AUTOMATED)")
-print("=" * 70)
+# UTF-8 emoji support on Windows
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 
-# ============== CONFIGURATION ==============
-DOWNLOAD_DIR = "downloaded_notes"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-# ============== STEP 1: SETUP CHROME ==============
-print("\n🔧 Setting up Chrome driver...")
-
-options = Options()
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-options.add_argument("--disable-gpu")
-options.add_argument("--window-size=1920,1080")
-
-# Use your Chrome profile (keeps you logged in)
-user_data_dir = os.path.expanduser("~") + "\\AppData\\Local\\Google\\Chrome\\User Data"
-options.add_argument(f"user-data-dir={user_data_dir}")
-options.add_argument("profile-directory=Default")
-
-# Disable notifications
-options.add_argument("--disable-notifications")
-options.add_argument("--disable-popup-blocking")
-
-# Download settings
-prefs = {
-    "download.default_directory": os.path.abspath(DOWNLOAD_DIR),
-    "download.prompt_for_download": False,
-    "download.directory_upgrade": True,
-    "safebrowsing.enabled": True,
-}
-options.add_experimental_option("prefs", prefs)
-
-# Start Chrome
-driver = webdriver.Chrome(
-    service=Service(ChromeDriverManager().install()),
-    options=options
-)
-print("✅ Chrome driver started")
-
-# ============== STEP 2: CHECK LOGIN ==============
-print("\n🔐 Checking Google Drive login...")
-driver.get("https://drive.google.com")
-time.sleep(3)
-
-if "accounts.google.com" in driver.current_url:
-    print("⚠️ Please log in to Google Drive in the browser window...")
-    print("⏳ Waiting for login (you have 2 minutes)...")
-    WebDriverWait(driver, 120).until(
-        EC.url_contains("drive.google.com")
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
     )
-    print("✅ Login successful!")
-else:
-    print("✅ Already logged in!")
+}
 
-# ============== STEP 3: SCRAPE INDEX PAGE ==============
-print("\n📥 Fetching index page...")
 
-response = requests.get(
-    "https://www.downloadclassnotes.com/english-notes-for-5th-class-for-punjab-schools-colleges/",
-    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-)
-soup = BeautifulSoup(response.text, 'html.parser')
 
-subpage_urls = []
-for tag in soup.find_all('a'):
-    href = tag.get('href')
-    if href:
-        if href.startswith('/'):
-            href = "https://www.downloadclassnotes.com" + href
-        if "downloadclassnotes.com" in href and "unit" in href and "english" in href.lower():
-            subpage_urls.append(href)
+# ==================== UTILITIES ====================
 
-print(f"✅ Found {len(subpage_urls)} unit pages")
+def extract_keywords(url):
+    """Extract meaningful keywords from URL path for matching."""
+    path = urlparse(url).path.strip('/')
+    words = re.findall(r'[a-zA-Z0-9]+', path.lower())
 
-# ============== STEP 4: SCAN FOR FILE IDs ==============
-print("\n🔍 Scanning for file IDs...")
+    stop_words = {
+        'for', 'and', 'the', 'to', 'a', 'in', 'of', 'with', 'by', 'on', 'at',
+        'from', 'an', 'is', 'are', 'notes', 'key', 'books', 'solved', 'exercises',
+        'solutions', 'guide', 'class', 'schools', 'colleges', 'level', 'primary',
+        'middle', 'elementary', 'secondary', 'higher', 'study', 'material',
+        'download', 'free', 'pdf', 'board', 'boards', 'post', 'category',
+        'wp', 'content', 'uploads'
+    }
 
-file_ids = set()
-patterns = [
-    r'/d/([a-zA-Z0-9_-]{25,})',
-    r'id=([a-zA-Z0-9_-]{25,})',
-    r'https://drive\.google\.com/file/d/([a-zA-Z0-9_-]{25,})',
+    keywords = set()
+    for w in words:
+        # Normalize "5th" -> "5"
+        m = re.match(r'^(\d+)(?:st|nd|rd|th)?$', w)
+        norm = m.group(1) if m else w
+        if norm not in stop_words and len(norm) > 1:
+            keywords.add(norm)
+    return keywords
+
+
+def natural_sort_key(s):
+    """Sort strings with embedded numbers naturally (Unit 2 before Unit 10)."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+
+
+# ==================== CRAWL & DETECT SUB-PAGES ====================
+
+def crawl_page(index_url):
+    """
+    Crawl the main page.
+    Auto-detects unit/chapter pages or subject-level pages.
+    Returns a list of content page URLs to scan for Drive PDFs.
+    """
+    print(f"\n📥 Fetching: {index_url}")
+    try:
+        resp = requests.get(index_url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    content = soup.find(class_='entry-content') or soup.find('body') or soup
+    target_keywords = extract_keywords(index_url)
+    domain = urlparse(index_url).netloc
+
+    # Collect unique links
+    seen = set()
+    links = []
+    for a in content.find_all('a'):
+        href = a.get('href')
+        if not href:
+            continue
+        href = urljoin(index_url, href)
+        href = urlparse(href)._replace(query="", fragment="").geturl()
+        if href not in seen:
+            seen.add(href)
+            text = re.sub(r'\s+', ' ', (a.text or '').replace('\n', ' ').strip())
+            links.append((href, text))
+
+    # Filter junk
+    skip = ['facebook.com', 'twitter.com', 'youtube.com', 'wa.me',
+            'about-us', 'contact-us', 'privacy-policy', 'blog',
+            'find-home-tutors', 'academic-notes-contribution', 'online-digital-services']
+
+    unit_re = re.compile(
+        r'(unit|chapter|chap|lec|exercise|part|lesson|story|essay|letter|application)', re.I
+    )
+
+    unit_candidates = []
+    subject_candidates = []
+
+    for href, text in links:
+        if not href.startswith('http') or domain not in href:
+            continue
+        if any(x in href.lower() for x in skip):
+            continue
+        if href.rstrip('/') == index_url.rstrip('/'):
+            continue
+
+        path = urlparse(href).path.strip('/')
+        is_unit = bool(unit_re.search(path)) or bool(unit_re.search(text))
+        cand_keywords = extract_keywords(href)
+        score = len(target_keywords & cand_keywords)
+
+        if target_keywords and score >= len(target_keywords):
+            (unit_candidates if is_unit else subject_candidates).append((href, text))
+        elif not target_keywords and is_unit:
+            unit_candidates.append((href, text))
+
+    # Case 1: Found unit pages directly
+    if unit_candidates:
+        urls = sorted(list(set(h for h, _ in unit_candidates)), key=natural_sort_key)
+        print(f"✅ Found {len(urls)} unit/chapter pages.")
+        return urls
+
+    # Case 2: Found subject pages — let user pick
+    if subject_candidates:
+        subject_candidates = sorted(list(set(subject_candidates)), key=lambda x: x[1])
+        print(f"\n📂 Found {len(subject_candidates)} subject pages:")
+        for i, (href, text) in enumerate(subject_candidates, 1):
+            print(f"  {i}. {text or '(no label)'}")
+        print(f"  {len(subject_candidates) + 1}. ALL subjects")
+
+        while True:
+            choice = input(f"\nSelect (1-{len(subject_candidates) + 1}): ").strip()
+            if choice.isdigit():
+                idx = int(choice)
+                if 1 <= idx <= len(subject_candidates):
+                    return crawl_page(subject_candidates[idx - 1][0])
+                elif idx == len(subject_candidates) + 1:
+                    all_units = []
+                    for url, _ in subject_candidates:
+                        all_units.extend(crawl_page(url))
+                    return sorted(list(set(all_units)), key=natural_sort_key)
+            print("❌ Invalid choice.")
+
+    # Case 3: Fallback — any unit-like links with lower match threshold
+    fallback = []
+    for href, text in links:
+        if not href.startswith('http') or domain not in href:
+            continue
+        if any(x in href.lower() for x in skip):
+            continue
+        if href.rstrip('/') == index_url.rstrip('/'):
+            continue
+        if unit_re.search(urlparse(href).path) or unit_re.search(text or ''):
+            fallback.append(href)
+
+    if fallback:
+        urls = sorted(list(set(fallback)), key=natural_sort_key)
+        print(f"⚠️ Fallback: found {len(urls)} potential pages.")
+        return urls
+
+    return []
+
+
+# ==================== SCAN FOR GOOGLE DRIVE IDS ====================
+
+DRIVE_PATTERNS = [
+    re.compile(r'/d/([a-zA-Z0-9_-]{25,})'),
+    re.compile(r'id=([a-zA-Z0-9_-]{25,})'),
 ]
 
-for idx, url in enumerate(sorted(subpage_urls), 1):
-    print(f"  [{idx}/{len(subpage_urls)}] Scanning: {url.split('/')[-2]}...")
-    
+
+def scan_for_drive_ids(url):
+    """Scan a page's HTML for Google Drive file IDs."""
+    found = set()
     try:
-        driver.get(url)
-        time.sleep(2)
-        content = driver.page_source
-        
-        found = set()
-        for pattern in patterns:
-            found.update(re.findall(pattern, content))
-        
-        file_ids.update(found)
-        if found:
-            print(f"    ✅ Found {len(found)} ID(s): {', '.join(list(found)[:3])}...")
-        else:
-            print("    ⚠️ No IDs found")
-            
-    except Exception as e:
-        print(f"    ❌ Error: {e}")
+        resp = requests.get(url, headers=HEADERS, timeout=12)
+        if resp.status_code != 200:
+            return url, found
 
-print(f"\n✅ Total unique file IDs found: {len(file_ids)}")
+        html = resp.text
+        for p in DRIVE_PATTERNS:
+            found.update(p.findall(html))
 
-if not file_ids:
-    print("\n❌ No file IDs found. Exiting...")
-    driver.quit()
-    exit()
+        # Also check iframes
+        soup = BeautifulSoup(html, 'html.parser')
+        for iframe in soup.find_all('iframe'):
+            src = iframe.get('src', '')
+            if 'drive.google.com' in src:
+                for p in DRIVE_PATTERNS:
+                    found.update(p.findall(src))
+    except Exception:
+        pass
+    return url, found
 
-# ============== STEP 5: DOWNLOAD FILES ==============
-print(f"\n⬇️ Downloading {len(file_ids)} files...")
 
-# Get cookies from browser for requests
-cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-session = requests.Session()
-session.cookies.update(cookies)
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-})
+# ==================== OPEN IN BRAVE ====================
 
-success_count = 0
-failed_files = []
+def find_brave():
+    """Find Brave browser executable on Windows."""
+    candidates = [
+        os.path.join(os.environ.get('PROGRAMFILES', ''), 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+        os.path.join(os.environ.get('PROGRAMFILES(X86)', ''), 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    return None
 
-for idx, file_id in enumerate(sorted(file_ids), 1):
-    print(f"\n[{idx}/{len(file_ids)}] 📥 Processing: {file_id[:15]}...")
-    
-    output_path = os.path.join(DOWNLOAD_DIR, f"unit_{idx}_{file_id}.pdf")
-    
-    # === METHOD 1: HTTP with cookies ===
-    try:
-        url = f"https://drive.google.com/uc?export=download&id={file_id}"
-        print("  🔄 Trying HTTP download...")
-        
-        response = session.get(url, allow_redirects=False)
-        
-        # Handle confirmation page
-        if "confirm" in response.text:
-            confirm_match = re.search(r'confirm=([^&]+)', response.text)
-            if confirm_match:
-                confirm_token = confirm_match.group(1)
-                download_url = f"https://drive.google.com/uc?export=download&confirm={confirm_token}&id={file_id}"
-                response = session.get(download_url)
-        
-        # Check if we got a valid PDF
-        if response.status_code == 200:
-            # Check headers or first few bytes
-            content_type = response.headers.get('Content-Type', '')
-            if 'application/pdf' in content_type or 'application/octet-stream' in content_type:
-                with open(output_path, 'wb') as f:
-                    f.write(response.content)
-                
-                # Verify it's a real PDF
-                with open(output_path, 'rb') as f:
-                    if f.read(5) == b'%PDF-':
-                        print("  ✅ HTTP download successful (valid PDF)")
-                        success_count += 1
-                        continue
-                    else:
-                        os.remove(output_path)
-                        print("  ⚠️ Downloaded file is not a valid PDF, trying Selenium...")
-            elif 'text/html' not in content_type:
-                # Might still be a valid file
-                with open(output_path, 'wb') as f:
-                    f.write(response.content)
-                print("  ✅ HTTP download successful (binary file)")
-                success_count += 1
-                continue
-            else:
-                print("  ⚠️ HTTP returned HTML page, trying Selenium...")
-        else:
-            print(f"  ⚠️ HTTP status {response.status_code}, trying Selenium...")
-            
-    except Exception as e:
-        print(f"  ⚠️ HTTP failed: {str(e)[:50]}")
 
-    # === METHOD 2: SELENIUM BROWSER DOWNLOAD ===
-    try:
-        print("  🔄 Trying Selenium browser download...")
-        
-        # Open the view page
-        view_url = f"https://drive.google.com/file/d/{file_id}/view"
-        driver.get(view_url)
-        time.sleep(3)
-        
-        # Click download button
-        try:
-            download_btn = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, "//*[@aria-label='Download']"))
-            )
-            download_btn.click()
-            print("  📥 Clicked download button")
-        except:
-            # Alternative: direct download URL
-            print("  🔄 Using direct download URL...")
-            driver.get(f"https://drive.google.com/uc?export=download&id={file_id}")
-        
-        time.sleep(2)
-        
-        # Handle "Download anyway" if it appears
-        try:
-            confirm_btn = driver.find_element(By.XPATH, "//*[contains(text(), 'Download anyway')]")
-            confirm_btn.click()
-            print("  ✅ Clicked 'Download anyway'")
-        except:
-            pass
-        
-        # Wait for download
-        print("  ⏳ Waiting for download to complete...")
-        time.sleep(5)
-        
-        # Find the downloaded file
-        files = glob.glob(os.path.join(DOWNLOAD_DIR, "*.pdf"))
-        files.sort(key=os.path.getctime)
-        
-        if files:
-            latest_file = files[-1]
-            # Check if it's a valid PDF
-            with open(latest_file, 'rb') as f:
-                if f.read(5) == b'%PDF-':
-                    # Rename to our desired name
-                    if latest_file != output_path:
-                        os.rename(latest_file, output_path)
-                    print("  ✅ Selenium download successful (valid PDF)")
-                    success_count += 1
-                    continue
+def open_all_in_brave(urls):
+    """Open all URLs as tabs in Brave browser."""
+    brave = find_brave()
+    if not brave:
+        print("❌ Brave not found! Opening in default browser instead...")
+        import webbrowser
+        for url in urls:
+            webbrowser.open(url)
+        return
+
+    print(f"\n🌐 Opening {len(urls)} tabs in Brave...")
+    subprocess.Popen([brave] + urls)
+    print("✅ Tabs opened! Use your extension to download each PDF.")
+
+
+# ==================== MAIN ====================
+
+def main():
+    print("=" * 60)
+    print("📚 TEXTBOOK PDF FINDER — Scrape & Open in Brave")
+    print("=" * 60)
+
+    url = input("\n🔗 Enter the main page URL: ").strip()
+    if not url:
+        print("❌ No URL. Exiting.")
+        return
+
+    # Step 1: Find sub-pages (units/chapters)
+    pages = crawl_page(url)
+    if not pages:
+        print("\n❌ No content pages found. Exiting.")
+        return
+
+    print(f"\n📂 Found {len(pages)} pages to scan:")
+    for i, p in enumerate(pages, 1):
+        print(f"  [{i}] {p.rstrip('/').split('/')[-1]}")
+
+    # Step 2: Scan all pages for Google Drive file IDs (parallel)
+    print("\n🔍 Scanning pages for Google Drive PDFs...")
+    drive_urls = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(scan_for_drive_ids, p): p for p in pages}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                scanned_url, ids = future.result()
+                name = scanned_url.rstrip('/').split('/')[-1]
+                if ids:
+                    print(f"  ✅ {name}: {len(ids)} PDF(s)")
+                    for fid in ids:
+                        drive_urls.append(f"https://drive.google.com/file/d/{fid}/view")
                 else:
-                    os.remove(latest_file)
-                    print("  ⚠️ Selenium downloaded invalid file")
-        else:
-            print("  ⚠️ No file found after download")
-            
-    except Exception as e:
-        print(f"  ❌ Selenium failed: {str(e)[:50]}")
+                    print(f"  ⚠️ {name}: no PDFs found")
+            except Exception as e:
+                print(f"  ❌ Error: {e}")
 
-    # If we get here, both methods failed
-    failed_files.append(file_id)
-    print("  ❌ All download methods failed")
+    if not drive_urls:
+        print("\n❌ No Google Drive PDFs found. Exiting.")
+        return
 
-# ============== STEP 6: VERIFY AND REPORT ==============
-print("\n" + "=" * 70)
-print("📊 DOWNLOAD REPORT")
-print("=" * 70)
+    # Remove duplicates, preserve order
+    seen = set()
+    unique_urls = []
+    for u in drive_urls:
+        if u not in seen:
+            seen.add(u)
+            unique_urls.append(u)
+    drive_urls = unique_urls
 
-# Count and verify downloads
-valid_pdfs = 0
-total_size = 0
+    print(f"\n📊 Total unique PDFs found: {len(drive_urls)}")
+    input("\n⏎ Press Enter to open all in Brave...")
 
-print("\n🔍 Verifying downloaded files:")
-for f in sorted(os.listdir(DOWNLOAD_DIR)):
-    if f.endswith('.pdf'):
-        path = os.path.join(DOWNLOAD_DIR, f)
-        size = os.path.getsize(path) / 1024  # KB
-        
-        with open(path, 'rb') as file:
-            header = file.read(5)
-            if header == b'%PDF-':
-                valid_pdfs += 1
-                total_size += size
-                status = "✅ VALID"
-            else:
-                status = "❌ INVALID"
-        
-        print(f"  {status} {f} ({size:.2f} KB)")
+    # Step 3: Open all in Brave
+    open_all_in_brave(drive_urls)
 
-print("\n" + "=" * 70)
-print("📊 FINAL SUMMARY")
-print("=" * 70)
-print(f"  📁 Total files found: {len(file_ids)}")
-print(f"  ✅ Successfully downloaded: {success_count}")
-print(f"  ✅ Valid PDFs: {valid_pdfs}")
-print(f"  ❌ Failed: {len(failed_files)}")
-print(f"  📦 Total size: {total_size:.2f} KB")
-print(f"  📂 Saved to: {os.path.abspath(DOWNLOAD_DIR)}")
 
-if failed_files:
-    print(f"\n⚠️ Failed files ({len(failed_files)}):")
-    for fid in failed_files:
-        print(f"    - https://drive.google.com/uc?id={fid}")
-
-if valid_pdfs == len(file_ids):
-    print("\n🎉 ALL FILES DOWNLOADED SUCCESSFULLY!")
-elif valid_pdfs > 0:
-    print(f"\n⚠️ Downloaded {valid_pdfs} out of {len(file_ids)} files.")
-    print("   You can manually download the failed ones from the links above.")
-else:
-    print("\n❌ No valid PDFs were downloaded.")
-    print("   Possible reasons:")
-    print("   1. Files require special permissions")
-    print("   2. Need to be logged into the correct Google account")
-    print("   3. Files may have been moved or deleted")
-
-# ============== STEP 7: CLEANUP ==============
-driver.quit()
-print("\n🧹 Cleanup complete")
-print("\n✨ Process complete!")
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Old script artifacts (no longer used)
+chrome_downloader_profile/
+temp_extension/
+downloaded_notes/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Dev log (internal only)
+log-book.md
