@@ -1,6 +1,15 @@
-# Textbook PDF Finder — Auto Download
+# Google Drive View-Only PDF Downloader
 
 A Python CLI tool that scrapes educational websites for Google Drive PDF links and **automatically downloads restricted/view-only PDFs** using headless browser preview capture. No manual browser interaction needed.
+
+> [!IMPORTANT]
+> **MUST READ BEFORE USING:**
+> To use the fully automated headless download engine, you **MUST** run:
+> ```bash
+> playwright install chromium
+> ```
+> after installing the Python dependencies. Without it, the script will fall back to opening tabs in your browser for manual downloading.
+
 
 ## How It Works
 
@@ -47,7 +56,7 @@ python downloader.py
 
 ```
 ============================================================
-📚 TEXTBOOK PDF FINDER — Auto Download
+📚 GOOGLE DRIVE VIEW-ONLY PDF DOWNLOADER
 ============================================================
 
 🔗 Enter the main page URL: https://example.com/class-10-notes/english/

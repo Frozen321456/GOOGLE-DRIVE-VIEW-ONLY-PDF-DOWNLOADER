@@ -1,5 +1,5 @@
 """
-Textbook PDF Finder — Auto Download
+Google Drive View-Only PDF Downloader
 
 Scrapes educational websites for Google Drive PDF links,
 then downloads restricted/view-only PDFs automatically using
@@ -290,45 +290,120 @@ async def capture_single_pdf(context, file_id, output_path, label=""):
 
         # Scroll through all pages to trigger lazy-loading of images.
         # Stop when the SCROLL POSITION stops changing (= reached the bottom).
-        # This is more reliable than counting new image URLs, since Google Drive
-        # continuously generates new URLs for re-rendered pages.
+        # We scroll via JS on the dynamic container, which works headlessly.
         stable_rounds = 0
 
         for _ in range(300):  # Safety limit
-            # Get scroll position BEFORE pressing PageDown
+            # Get scroll position BEFORE scrolling
             scroll_before = await page.evaluate('''() => {
-                // Try common scroll containers in Google Drive viewer
-                const containers = [
-                    document.querySelector('[role="document"]'),
-                    document.querySelector('[role="presentation"]'),
-                    document.querySelector('.ndfHFb-c4YZDc-Wrql6b'),
-                    document.documentElement
-                ];
-                for (const c of containers) {
-                    if (c && c.scrollHeight > c.clientHeight + 10) {
-                        return c.scrollTop;
+                const findScrollContainer = () => {
+                    const doc = document.querySelector('[role="document"]');
+                    if (doc) {
+                        let parent = doc;
+                        while (parent) {
+                            if (parent.scrollHeight > parent.clientHeight + 10) {
+                                const style = window.getComputedStyle(parent);
+                                if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                    return parent;
+                                }
+                            }
+                            parent = parent.parentElement;
+                        }
                     }
-                }
-                return window.scrollY || document.documentElement.scrollTop || 0;
+                    const divs = Array.from(document.querySelectorAll('div'));
+                    let best = null;
+                    let maxScroll = 0;
+                    for (const div of divs) {
+                        if (div.scrollHeight > div.clientHeight + 50) {
+                            const style = window.getComputedStyle(div);
+                            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                if (div.scrollHeight > maxScroll) {
+                                    maxScroll = div.scrollHeight;
+                                    best = div;
+                                }
+                            }
+                        }
+                    }
+                    return best || document.documentElement;
+                };
+                const c = findScrollContainer();
+                return c ? c.scrollTop : 0;
             }''')
 
-            await page.keyboard.press("PageDown")
-            await page.wait_for_timeout(500)
+            # Scroll down by clientHeight * 0.8
+            await page.evaluate('''() => {
+                const findScrollContainer = () => {
+                    const doc = document.querySelector('[role="document"]');
+                    if (doc) {
+                        let parent = doc;
+                        while (parent) {
+                            if (parent.scrollHeight > parent.clientHeight + 10) {
+                                const style = window.getComputedStyle(parent);
+                                if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                    return parent;
+                                }
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+                    const divs = Array.from(document.querySelectorAll('div'));
+                    let best = null;
+                    let maxScroll = 0;
+                    for (const div of divs) {
+                        if (div.scrollHeight > div.clientHeight + 50) {
+                            const style = window.getComputedStyle(div);
+                            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                if (div.scrollHeight > maxScroll) {
+                                    maxScroll = div.scrollHeight;
+                                    best = div;
+                                }
+                            }
+                        }
+                    }
+                    return best || document.documentElement;
+                };
+                const c = findScrollContainer();
+                if (c) {
+                    c.scrollTop += c.clientHeight * 0.8;
+                }
+            }''')
+            
+            await page.wait_for_timeout(1000)
 
             # Get scroll position AFTER
             scroll_after = await page.evaluate('''() => {
-                const containers = [
-                    document.querySelector('[role="document"]'),
-                    document.querySelector('[role="presentation"]'),
-                    document.querySelector('.ndfHFb-c4YZDc-Wrql6b'),
-                    document.documentElement
-                ];
-                for (const c of containers) {
-                    if (c && c.scrollHeight > c.clientHeight + 10) {
-                        return c.scrollTop;
+                const findScrollContainer = () => {
+                    const doc = document.querySelector('[role="document"]');
+                    if (doc) {
+                        let parent = doc;
+                        while (parent) {
+                            if (parent.scrollHeight > parent.clientHeight + 10) {
+                                const style = window.getComputedStyle(parent);
+                                if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                    return parent;
+                                }
+                            }
+                            parent = parent.parentElement;
+                        }
                     }
-                }
-                return window.scrollY || document.documentElement.scrollTop || 0;
+                    const divs = Array.from(document.querySelectorAll('div'));
+                    let best = null;
+                    let maxScroll = 0;
+                    for (const div of divs) {
+                        if (div.scrollHeight > div.clientHeight + 50) {
+                            const style = window.getComputedStyle(div);
+                            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                if (div.scrollHeight > maxScroll) {
+                                    maxScroll = div.scrollHeight;
+                                    best = div;
+                                }
+                            }
+                        }
+                    }
+                    return best || document.documentElement;
+                };
+                const c = findScrollContainer();
+                return c ? c.scrollTop : 0;
             }''')
 
             if scroll_after == scroll_before:
@@ -351,74 +426,70 @@ async def capture_single_pdf(context, file_id, output_path, label=""):
     if not captured_by_url:
         return False, 0, "No page images captured from preview"
 
-    # === TWO-STAGE DEDUPLICATION ===
+    # === DEDUPLICATION & PAGE ASSEMBLY ===
+    import urllib.parse
+    import hashlib
 
-    # Stage 1: Group by exact (width, height) dimensions.
-    # All pages of a PDF render at identical dimensions. UI elements vary.
-    # Pick the largest group at the highest resolution.
-    dim_groups = {}  # (width, height) -> [img_bytes, ...]
-    for img_bytes in captured_by_url.values():
+    # Group images by URL page parameter
+    pages_by_num = {}  # int -> bytes
+    unpageable_images = []  # list of bytes for images that don't have page= query param
+
+    raw_count = len(captured_by_url)
+
+    for url, img_bytes in captured_by_url.items():
         try:
+            # Check dimensions to skip icons
             img = Image.open(io.BytesIO(img_bytes))
             if img.width < 200 or img.height < 200:
                 continue
-            key = (img.width, img.height)
-            dim_groups.setdefault(key, []).append(img_bytes)
         except Exception:
             continue
 
-    if not dim_groups:
-        return False, 0, "No valid page images found"
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
 
-    # Pick the group at the highest resolution (most pixels)
-    # This avoids picking a big group of low-res thumbnails
-    best_dims = max(dim_groups.keys(), key=lambda d: d[0] * d[1])
-    page_images = dim_groups[best_dims]
+        if 'page' in qs:
+            try:
+                page_num = int(qs['page'][0])
+                # Keep the largest file (highest quality/resolution) for this page number
+                if page_num not in pages_by_num or len(img_bytes) > len(pages_by_num[page_num]):
+                    pages_by_num[page_num] = img_bytes
+            except ValueError:
+                unpageable_images.append(img_bytes)
+        else:
+            unpageable_images.append(img_bytes)
 
-    # Stage 2: Within the selected resolution group, deduplicate using
-    # perceptual hash with hamming distance tolerance.
-    # Google Drive re-renders pages as you scroll, producing visually identical
-    # images with slightly different pixel values. An 8x8 average hash with
-    # hamming distance <= 5 catches these re-render duplicates.
-    def avg_hash(img_bytes, size=8):
-        """Compute 8x8 average hash — 64-bit visual fingerprint."""
-        img = Image.open(io.BytesIO(img_bytes))
-        thumb = img.resize((size, size), Image.LANCZOS).convert('L')
-        pixels = list(thumb.getdata())
-        avg = sum(pixels) / len(pixels)
-        return tuple(1 if p > avg else 0 for p in pixels)
+    unique_pages = []
 
-    def hamming_distance(h1, h2):
-        """Count differing bits between two hashes."""
-        return sum(a != b for a, b in zip(h1, h2))
+    if pages_by_num:
+        # Reconstruct PDF using the sorted page numbers
+        sorted_page_nums = sorted(pages_by_num.keys())
+        for p_num in sorted_page_nums:
+            unique_pages.append(pages_by_num[p_num])
+        print(f"  🔍 [{label}] Dedup: grouped by URL page parameter. Captured: {raw_count} | Unique: {len(unique_pages)}")
+    else:
+        # Fallback to byte-identical deduplication (MD5) as suggested in senior review
+        seen_hashes = set()
+        for img_bytes in unpageable_images:
+            try:
+                img_hash = hashlib.md5(img_bytes).hexdigest()
+                if img_hash not in seen_hashes:
+                    seen_hashes.add(img_hash)
+                    unique_pages.append(img_bytes)
+            except Exception:
+                continue
+        print(f"  🔍 [{label}] Dedup: fallback (MD5 hashing). Captured: {raw_count} | Unique: {len(unique_pages)}")
 
-    HAMMING_THRESHOLD = 5  # Allow up to 5/64 bits difference
+    if not unique_pages:
+        return False, 0, "No unique page images found"
 
-    unique_pages = []  # [(hash, img_bytes), ...]
-    for img_bytes in page_images:
-        try:
-            h = avg_hash(img_bytes)
-        except Exception:
-            continue
-
-        # Check if this image matches any already-captured page
-        is_duplicate = False
-        for i, (existing_hash, existing_bytes) in enumerate(unique_pages):
-            if hamming_distance(h, existing_hash) <= HAMMING_THRESHOLD:
-                # Same page — keep the larger file (higher quality)
-                if len(img_bytes) > len(existing_bytes):
-                    unique_pages[i] = (h, img_bytes)
-                is_duplicate = True
-                break
-
-        if not is_duplicate:
-            unique_pages.append((h, img_bytes))
-
-    # Process unique page images: convert to RGB JPEG
+    # Process page images: convert to RGB JPEG
     processed = []
-    for _, img_bytes in unique_pages:
+    resolutions = []
+    for img_bytes in unique_pages:
         try:
             img = Image.open(io.BytesIO(img_bytes))
+            resolutions.append(f"{img.width}x{img.height}")
             if img.mode != 'RGB':
                 img = img.convert('RGB')
             buf = io.BytesIO()
@@ -429,6 +500,10 @@ async def capture_single_pdf(context, file_id, output_path, label=""):
 
     if not processed:
         return False, 0, "Captured images could not be processed"
+
+    # Report page resolutions for validation
+    res_summary = ", ".join(set(resolutions))
+    print(f"  📊 [{label}] Compiled {len(processed)} pages (resolutions: {res_summary})")
 
     # Combine all page images into a single PDF
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -522,7 +597,7 @@ def open_failures_in_brave(failed_results):
 
 def main():
     print("=" * 60)
-    print("📚 TEXTBOOK PDF FINDER — Auto Download")
+    print("📚 GOOGLE DRIVE VIEW-ONLY PDF DOWNLOADER")
     print("=" * 60)
 
     if not HEADLESS_AVAILABLE:
