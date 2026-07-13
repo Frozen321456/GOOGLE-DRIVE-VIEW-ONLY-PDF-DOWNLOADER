@@ -10,6 +10,9 @@ chrome_downloader_profile/
 temp_extension/
 downloaded_notes/
 
+# Downloaded PDFs output
+downloads/
+
 # OS
 Thumbs.db
 .DS_Store

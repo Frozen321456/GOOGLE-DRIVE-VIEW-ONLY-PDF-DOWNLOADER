@@ -1,35 +1,41 @@
-# Textbook PDF Finder
+# Textbook PDF Finder — Auto Download
 
-A lightweight Python script that scrapes educational websites for Google Drive PDF links and opens them all in your browser at once. Designed to work with the **[Document Preview Exporter](https://chromewebstore.google.com/detail/document-preview-exporter/npapjbliocdhineglcjkmmmaddpgeono)** browser extension to download view-only PDFs from Google Drive.
+A Python CLI tool that scrapes educational websites for Google Drive PDF links and **automatically downloads restricted/view-only PDFs** using headless browser preview capture. No manual browser interaction needed.
 
 ## How It Works
 
 1. **Paste a URL** — Give it the main page of a textbook/notes website
 2. **Auto-crawl** — It finds all unit/chapter sub-pages automatically
 3. **Extract links** — Scans every sub-page for Google Drive file IDs (in parallel)
-4. **Open in browser** — Opens all PDF preview links in Brave as tabs at once
-5. **Download** — Use the Document Preview Exporter extension on each tab to save the PDF
+4. **Auto-download** — Downloads all PDFs in parallel (3 at a time) using headless browser
+5. **Fallback** — Any failed downloads are offered to open in Brave for manual export
+
+### Why Headless Browser?
+
+Many educational PDFs on Google Drive have **download restrictions** enabled by the owner. Standard tools (`gdown`, `curl`, `wget`) cannot download these files. This tool uses an invisible (headless) Chromium browser to:
+- Load the Google Drive preview page
+- Capture the rendered page images as Google scrolls through the document
+- Combine all page images into a proper PDF file
 
 ## Prerequisites
 
 ### 1. Install Python Dependencies
 
 ```bash
-pip install requests beautifulsoup4
+pip install requests beautifulsoup4 playwright img2pdf Pillow
 ```
 
-### 2. Install the Browser Extension
+### 2. Install Chromium for Playwright
 
-Install the **Document Preview Exporter for Google Drive** extension:
+```bash
+playwright install chromium
+```
 
-- **Chrome**: [Chrome Web Store](https://chromewebstore.google.com/detail/document-preview-exporter/npapjbliocdhineglcjkmmmaddpgeono)
-- **Brave**: Same link — Brave supports Chrome extensions
+> This downloads a Chromium browser binary (~150MB, one-time). It runs invisibly — no browser window opens during download.
 
-> This extension lets you download view-only/restricted PDFs from Google Drive previews. Without it, you'd only be able to view but not save the files.
+### 3. Browser Fallback (Optional)
 
-### 3. Browser
-
-The script auto-detects **Brave** on Windows. If Brave is not found, it falls back to your default browser.
+If any PDFs fail to auto-download, the tool offers to open them in **Brave** browser where you can use the [Document Preview Exporter](https://chromewebstore.google.com/detail/document-preview-exporter/npapjbliocdhineglcjkmmmaddpgeono) extension to save them manually.
 
 ## Usage
 
@@ -37,11 +43,11 @@ The script auto-detects **Brave** on Windows. If Brave is not found, it falls ba
 python downloader.py
 ```
 
-Then paste the main page URL when prompted:
+### Example Output
 
 ```
 ============================================================
-📚 TEXTBOOK PDF FINDER — Scrape & Open in Brave
+📚 TEXTBOOK PDF FINDER — Auto Download
 ============================================================
 
 🔗 Enter the main page URL: https://example.com/class-10-notes/english/
@@ -60,11 +66,15 @@ Then paste the main page URL when prompted:
   ...
 
 📊 Total unique PDFs found: 12
+📂 Output folder: downloads/class-10-english/
 
-⏎ Press Enter to open all in Brave...
+⬇️  Downloading 12 PDFs (3 at a time)...
+  ✅ [1/12] unit-1.pdf (15 pages)
+  ✅ [2/12] unit-2.pdf (8 pages)
+  ⬇️  [3/12] unit-3.pdf downloading...
+  ...
 
-🌐 Opening 12 tabs in Brave...
-✅ Tabs opened! Use your extension to download each PDF.
+🎉 Done! 12/12 PDFs saved to downloads/class-10-english/
 ```
 
 ### Multi-Level Navigation
@@ -83,24 +93,21 @@ If the URL is a landing page with multiple subjects, the script shows a selectio
 Select (1-6):
 ```
 
-## How the Extension Works
-
-Once all tabs are open in your browser:
-
-1. Go to each tab (Google Drive preview page)
-2. Click the **Document Preview Exporter** extension icon
-3. Enter a filename
-4. Click download — the extension exports the preview as a PDF
-
 ## Project Structure
 
 ```
 textbook_downloader/
-├── downloader.py      # Main script
+├── downloader.py      # Main script (crawl + headless download)
 ├── requirements.txt   # Python dependencies
+├── downloads/         # Auto-created output folder
+├── log-book.md        # Development log
 ├── LICENSE            # MIT License
 └── README.md          # This file
 ```
+
+## Fallback Mode
+
+If `playwright`/`img2pdf`/`Pillow` are not installed, the tool falls back to the old behavior: opening all PDF links as tabs in Brave browser for manual download using the Document Preview Exporter extension.
 
 ## License
 
