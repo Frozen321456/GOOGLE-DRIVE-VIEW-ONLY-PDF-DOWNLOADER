@@ -288,6 +288,16 @@ async def capture_single_pdf(context, file_id, output_path, label=""):
         if "denied" in page_title.lower() or "not found" in page_title.lower():
             return False, 0, "Access denied or file not found"
 
+        # Clean title to get a safe filename (e.g. "Unit 01.pdf - Google Drive" -> "Unit 01.pdf")
+        filename_title = page_title
+        if " - Google Drive" in filename_title:
+            filename_title = filename_title.replace(" - Google Drive", "")
+        if filename_title.lower().endswith(".pdf"):
+            filename_title = filename_title[:-4]
+        filename_title = re.sub(r'[\\/*?:"<>|]', "", filename_title).strip()
+        if not filename_title:
+            filename_title = "document"
+
         # Scroll through all pages to trigger lazy-loading of images.
         # Stop when the SCROLL POSITION stops changing (= reached the bottom).
         # We scroll via JS on the dynamic container, which works headlessly.
@@ -506,10 +516,14 @@ async def capture_single_pdf(context, file_id, output_path, label=""):
     print(f"  📊 [{label}] Compiled {len(processed)} pages (resolutions: {res_summary})")
 
     # Combine all page images into a single PDF
+    if label == "document" and 'filename_title' in locals():
+        output_path = output_path.parent / f"{filename_title}.pdf"
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, 'wb') as f:
         f.write(img2pdf.convert(processed))
 
+    print(f"  ✅ Saved: {output_path.name}")
     return True, len(processed), None
 
 
@@ -612,51 +626,67 @@ def main():
         print("❌ No URL. Exiting.")
         return
 
-    # Step 1: Find sub-pages (units/chapters)
-    pages = crawl_page(url)
-    if not pages:
-        print("\n❌ No content pages found. Exiting.")
-        return
+    # Check if the URL is a direct Google Drive link or file ID
+    direct_id = None
+    if "drive.google.com" in url:
+        for pattern in DRIVE_PATTERNS:
+            m = pattern.search(url)
+            if m:
+                direct_id = m.group(1)
+                break
+    elif re.match(r'^[a-zA-Z0-9_-]{25,}$', url):
+        direct_id = url
 
-    print(f"\n📂 Found {len(pages)} pages to scan:")
-    for i, p in enumerate(pages, 1):
-        print(f"  [{i}] {p.rstrip('/').split('/')[-1]}")
+    if direct_id:
+        print(f"🎯 Detected direct Google Drive link/ID: {direct_id}")
+        file_entries = [(direct_id, "document")]
+        folder_name = "direct"
+    else:
+        # Step 1: Find sub-pages (units/chapters)
+        pages = crawl_page(url)
+        if not pages:
+            print("\n❌ No content pages found. Exiting.")
+            return
 
-    # Step 2: Scan all pages for Google Drive file IDs (parallel)
-    print("\n🔍 Scanning pages for Google Drive PDFs...")
-    file_entries = []  # (file_id, display_name)
-    seen_ids = set()
+        print(f"\n📂 Found {len(pages)} pages to scan:")
+        for i, p in enumerate(pages, 1):
+            print(f"  [{i}] {p.rstrip('/').split('/')[-1]}")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(scan_for_drive_ids, p): p for p in pages}
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                scanned_url, ids = future.result()
-                name = scanned_url.rstrip('/').split('/')[-1]
-                if ids:
-                    print(f"  ✅ {name}: {len(ids)} PDF(s)")
-                    for j, fid in enumerate(sorted(ids)):
-                        if fid not in seen_ids:
-                            seen_ids.add(fid)
-                            suffix = f"-{j + 1}" if len(ids) > 1 else ""
-                            file_entries.append((fid, f"{name}{suffix}"))
-                else:
-                    print(f"  ⚠️ {name}: no PDFs found")
-            except Exception as e:
-                print(f"  ❌ Error: {e}")
+        # Step 2: Scan all pages for Google Drive file IDs (parallel)
+        print("\n🔍 Scanning pages for Google Drive PDFs...")
+        file_entries = []  # (file_id, display_name)
+        seen_ids = set()
 
-    if not file_entries:
-        print("\n❌ No Google Drive PDFs found. Exiting.")
-        return
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(scan_for_drive_ids, p): p for p in pages}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    scanned_url, ids = future.result()
+                    name = scanned_url.rstrip('/').split('/')[-1]
+                    if ids:
+                        print(f"  ✅ {name}: {len(ids)} PDF(s)")
+                        for j, fid in enumerate(sorted(ids)):
+                            if fid not in seen_ids:
+                                seen_ids.add(fid)
+                                suffix = f"-{j + 1}" if len(ids) > 1 else ""
+                                file_entries.append((fid, f"{name}{suffix}"))
+                    else:
+                        print(f"  ⚠️ {name}: no PDFs found")
+                except Exception as e:
+                    print(f"  ❌ Error: {e}")
 
-    # Sort entries naturally by name
-    file_entries.sort(key=lambda x: natural_sort_key(x[1]))
+        if not file_entries:
+            print("\n❌ No Google Drive PDFs found. Exiting.")
+            return
+
+        # Sort entries naturally by name
+        file_entries.sort(key=lambda x: natural_sort_key(x[1]))
+        folder_name = derive_folder_name(url)
 
     print(f"\n📊 Total unique PDFs found: {len(file_entries)}")
 
     # Step 3: Download or open in browser
     if HEADLESS_AVAILABLE:
-        folder_name = derive_folder_name(url)
         output_dir = os.path.join(DOWNLOAD_DIR, folder_name)
         print(f"📂 Output folder: {output_dir}/")
         print(f"\n⬇️  Downloading {len(file_entries)} PDFs"
