@@ -13,11 +13,8 @@ A Python CLI tool that scrapes educational websites for Google Drive PDF links a
 
 ## How It Works
 
-1. **Paste a URL** — Give it the main page of a textbook/notes website
-2. **Auto-crawl** — It finds all unit/chapter sub-pages automatically
-3. **Extract links** — Scans every sub-page for Google Drive file IDs (in parallel)
-4. **Auto-download** — Downloads all PDFs in parallel (3 at a time) using headless browser
-5. **Fallback** — Any failed downloads are offered to open in Brave for manual export
+* **Subject Crawling Mode (Bulk):** Paste the URL of an educational website's index page. The script dynamically crawls and finds all unit/chapter sub-pages, scans them in parallel for Google Drive view-only PDF IDs, and downloads them in parallel.
+* **Direct Mode (Single PDF):** Paste a direct Google Drive viewer URL or file ID directly. The script detects it, bypasses the crawling/scanning phase, retrieves the document's real filename dynamically from the preview title page, and downloads the PDF immediately.
 
 ### Why Headless Browser?
 
@@ -51,6 +48,11 @@ If any PDFs fail to auto-download, the tool offers to open them in **Brave** bro
 ```bash
 python downloader.py
 ```
+
+You can paste either:
+1. An index page of an educational website to download all listed PDFs.
+2. A direct Google Drive sharing link (e.g. `https://drive.google.com/file/d/.../view`).
+3. An exact Google Drive file ID (e.g. `1nDKKBVuYK-4PZsgT9EbydLl5VDxuct05`).
 
 ### Example Output
 
