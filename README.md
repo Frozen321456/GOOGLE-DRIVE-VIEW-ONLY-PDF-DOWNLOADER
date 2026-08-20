@@ -50,9 +50,11 @@ python downloader.py
 ```
 
 You can paste either:
-1. An index page of an educational website to download all listed PDFs.
-2. A direct Google Drive sharing link (e.g. `https://drive.google.com/file/d/.../view`).
-3. An exact Google Drive file ID (e.g. `1nDKKBVuYK-4PZsgT9EbydLl5VDxuct05`).
+1. An index page or section page (e.g. Nasar, Nazam, Ghazal, Grammar, Units/Lessons) to automatically crawl and download all related units/parts.
+2. Multiple URLs or a markdown link list containing multiple sections or units.
+3. A direct Google Drive sharing link (e.g. `https://drive.google.com/file/d/.../view`).
+4. An exact Google Drive file ID (e.g. `1nDKKBVuYK-4PZsgT9EbydLl5VDxuct05`).
+5. A `.txt` file containing URLs.
 
 ### Example Output
 
