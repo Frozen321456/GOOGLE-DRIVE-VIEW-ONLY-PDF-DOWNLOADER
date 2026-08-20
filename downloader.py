@@ -52,7 +52,22 @@ DOWNLOAD_DIR = "downloads"
 
 # ==================== UTILITIES ====================
 
-def extract_keywords(url):
+UNIT_SECTION_WORDS = {
+    'unit', 'chapter', 'chap', 'lec', 'lecture', 'exercise', 'part',
+    'lesson', 'story', 'stories', 'essay', 'essays', 'letter', 'letters',
+    'application', 'applications', 'dialogue', 'dialogues', 'nazam', 'nazm',
+    'ghazal', 'gazal', 'nasar', 'nasr', 'grammar', 'qawaid', 'khulasa',
+    'khatoot', 'mukalma', 'kahani', 'darkhwast', 'rubaiyat',
+    'qataat', 'poetry', 'prose', 'comprehension', 'mcq', 'mcqs'
+}
+
+UNIT_RE = re.compile(
+    r'(unit|chapter|chap|lec|exercise|part|lesson|story|stories|essay|essays|letter|letters|application|applications|dialogue|dialogues|nazam|nazm|ghazal|gazal|nasar|nasr|grammar|qawaid|khulasa|khatoot|mukalma|kahani|darkhwast|aap-?beeti|rubaiyat|qataat|poetry|prose|comprehension|mcq|mcqs)',
+    re.I
+)
+
+
+def extract_keywords(url, include_units=False):
     """Extract meaningful keywords from URL path for matching."""
     path = urlparse(url).path.strip('/')
     words = re.findall(r'[a-zA-Z0-9]+', path.lower())
@@ -65,12 +80,18 @@ def extract_keywords(url):
         'download', 'free', 'pdf', 'board', 'boards', 'post', 'category',
         'wp', 'content', 'uploads'
     }
+    if not include_units:
+        stop_words.update(UNIT_SECTION_WORDS)
 
     keywords = set()
     for w in words:
         # Normalize "5th" -> "5"
         m = re.match(r'^(\d+)(?:st|nd|rd|th)?$', w)
         norm = m.group(1) if m else w
+        norm = norm.lstrip('0') or '0'
+        # Do not include pure digits or stop words in general subject keywords
+        if norm.isdigit():
+            continue
         if norm not in stop_words and len(norm) > 1:
             keywords.add(norm)
     return keywords
@@ -93,12 +114,37 @@ def derive_folder_name(url):
     return name[:80] or 'drive-pdfs'
 
 
+def parse_urls(input_text):
+    """Extract all HTTP/Drive URLs from raw input text (including markdown links)."""
+    # Check if input is a text file path
+    if os.path.isfile(input_text.strip()):
+        try:
+            with open(input_text.strip(), 'r', encoding='utf-8') as f:
+                input_text = f.read()
+        except Exception:
+            pass
+
+    urls = re.findall(r'https?://[^\s)\]"\'>]+', input_text)
+    if not urls:
+        bare_id = input_text.strip()
+        if re.match(r'^[a-zA-Z0-9_-]{25,}$', bare_id):
+            return [bare_id]
+    cleaned = []
+    seen = set()
+    for u in urls:
+        u = u.rstrip('.,;)]\'"')
+        if u and u not in seen:
+            seen.add(u)
+            cleaned.append(u)
+    return cleaned
+
+
 # ==================== CRAWL & DETECT SUB-PAGES ====================
 
 def crawl_page(index_url):
     """
     Crawl the main page.
-    Auto-detects unit/chapter pages or subject-level pages.
+    Auto-detects unit/chapter/nazam/ghazal/grammar pages or subject-level pages.
     Returns a list of content page URLs to scan for Drive PDFs.
     """
     print(f"\n📥 Fetching: {index_url}")
@@ -107,7 +153,7 @@ def crawl_page(index_url):
         resp.raise_for_status()
     except Exception as e:
         print(f"❌ Error: {e}")
-        return []
+        return [index_url] if index_url.startswith("http") else []
 
     soup = BeautifulSoup(resp.text, 'html.parser')
     content = soup.find(class_='entry-content') or soup.find('body') or soup
@@ -133,12 +179,13 @@ def crawl_page(index_url):
             'about-us', 'contact-us', 'privacy-policy', 'blog',
             'find-home-tutors', 'academic-notes-contribution', 'online-digital-services']
 
-    unit_re = re.compile(
-        r'(unit|chapter|chap|lec|exercise|part|lesson|story|essay|letter|application)', re.I
-    )
-
     unit_candidates = []
     subject_candidates = []
+
+    # If the index_url itself is a unit/chapter/section page, include it
+    index_path = urlparse(index_url).path.strip('/')
+    if UNIT_RE.search(index_path):
+        unit_candidates.append((index_url, ""))
 
     for href, text in links:
         if not href.startswith('http') or domain not in href:
@@ -149,7 +196,7 @@ def crawl_page(index_url):
             continue
 
         path = urlparse(href).path.strip('/')
-        is_unit = bool(unit_re.search(path)) or bool(unit_re.search(text))
+        is_unit = bool(UNIT_RE.search(path)) or bool(UNIT_RE.search(text))
         cand_keywords = extract_keywords(href)
         score = len(target_keywords & cand_keywords)
 
@@ -161,7 +208,7 @@ def crawl_page(index_url):
     # Case 1: Found unit pages directly
     if unit_candidates:
         urls = sorted(list(set(h for h, _ in unit_candidates)), key=natural_sort_key)
-        print(f"✅ Found {len(urls)} unit/chapter pages.")
+        print(f"✅ Found {len(urls)} unit/section pages.")
         return urls
 
     # Case 2: Found subject pages — let user pick
@@ -187,6 +234,9 @@ def crawl_page(index_url):
 
     # Case 3: Fallback — any unit-like links with lower match threshold
     fallback = []
+    if UNIT_RE.search(index_path):
+        fallback.append(index_url)
+
     for href, text in links:
         if not href.startswith('http') or domain not in href:
             continue
@@ -194,7 +244,7 @@ def crawl_page(index_url):
             continue
         if href.rstrip('/') == index_url.rstrip('/'):
             continue
-        if unit_re.search(urlparse(href).path) or unit_re.search(text or ''):
+        if UNIT_RE.search(urlparse(href).path) or UNIT_RE.search(text or ''):
             fallback.append(href)
 
     if fallback:
@@ -202,7 +252,8 @@ def crawl_page(index_url):
         print(f"⚠️ Fallback: found {len(urls)} potential pages.")
         return urls
 
-    return []
+    # If no sub-links were found, treat the page itself as the target content page
+    return [index_url]
 
 
 # ==================== SCAN FOR GOOGLE DRIVE IDS ====================
@@ -621,44 +672,52 @@ def main():
         print("    playwright install chromium")
         print("\n  Falling back to browser-only mode (opens tabs in Brave).\n")
 
-    url = input("\n🔗 Enter the main page URL: ").strip()
-    if not url:
-        print("❌ No URL. Exiting.")
+    user_input = input("\n🔗 Enter page URL(s), markdown links, or text file: ").strip()
+    if not user_input:
+        print("❌ No URL provided. Exiting.")
         return
 
-    # Check if the URL is a direct Google Drive link or file ID
-    direct_id = None
-    if "drive.google.com" in url:
-        for pattern in DRIVE_PATTERNS:
-            m = pattern.search(url)
-            if m:
-                direct_id = m.group(1)
-                break
-    elif re.match(r'^[a-zA-Z0-9_-]{25,}$', url):
-        direct_id = url
+    raw_urls = parse_urls(user_input)
+    if not raw_urls:
+        print("❌ No valid URLs or Drive IDs found. Exiting.")
+        return
 
-    if direct_id:
-        print(f"🎯 Detected direct Google Drive link/ID: {direct_id}")
-        file_entries = [(direct_id, "document")]
-        folder_name = "direct"
-    else:
-        # Step 1: Find sub-pages (units/chapters)
-        pages = crawl_page(url)
-        if not pages:
-            print("\n❌ No content pages found. Exiting.")
-            return
+    file_entries = []  # (file_id, display_name)
+    seen_ids = set()
+    pages_to_scan = set()
 
-        print(f"\n📂 Found {len(pages)} pages to scan:")
-        for i, p in enumerate(pages, 1):
+    for item in raw_urls:
+        # Check if direct Google Drive link or file ID
+        direct_id = None
+        if "drive.google.com" in item:
+            for pattern in DRIVE_PATTERNS:
+                m = pattern.search(item)
+                if m:
+                    direct_id = m.group(1)
+                    break
+        elif re.match(r'^[a-zA-Z0-9_-]{25,}$', item):
+            direct_id = item
+
+        if direct_id:
+            if direct_id not in seen_ids:
+                seen_ids.add(direct_id)
+                file_entries.append((direct_id, f"drive-doc-{len(file_entries) + 1}"))
+        else:
+            # Crawl page or add directly
+            sub_pages = crawl_page(item)
+            for p in sub_pages:
+                pages_to_scan.add(p)
+
+    # Scan collected content pages for Google Drive file IDs
+    if pages_to_scan:
+        sorted_pages = sorted(list(pages_to_scan), key=natural_sort_key)
+        print(f"\n📂 Total {len(sorted_pages)} page(s) to scan:")
+        for i, p in enumerate(sorted_pages, 1):
             print(f"  [{i}] {p.rstrip('/').split('/')[-1]}")
 
-        # Step 2: Scan all pages for Google Drive file IDs (parallel)
         print("\n🔍 Scanning pages for Google Drive PDFs...")
-        file_entries = []  # (file_id, display_name)
-        seen_ids = set()
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(scan_for_drive_ids, p): p for p in pages}
+            futures = {pool.submit(scan_for_drive_ids, p): p for p in sorted_pages}
             for future in concurrent.futures.as_completed(futures):
                 try:
                     scanned_url, ids = future.result()
@@ -675,13 +734,13 @@ def main():
                 except Exception as e:
                     print(f"  ❌ Error: {e}")
 
-        if not file_entries:
-            print("\n❌ No Google Drive PDFs found. Exiting.")
-            return
+    if not file_entries:
+        print("\n❌ No Google Drive PDFs found. Exiting.")
+        return
 
-        # Sort entries naturally by name
-        file_entries.sort(key=lambda x: natural_sort_key(x[1]))
-        folder_name = derive_folder_name(url)
+    # Sort entries naturally by name
+    file_entries.sort(key=lambda x: natural_sort_key(x[1]))
+    folder_name = derive_folder_name(raw_urls[0] if raw_urls else "drive-pdfs")
 
     print(f"\n📊 Total unique PDFs found: {len(file_entries)}")
 
