@@ -1,25 +1,19 @@
-# Python
+# secrets
+.env
+.env.local
+*.pem
+service-account*.json
+firebase-credentials*.json
+
+# python
 __pycache__/
 *.py[cod]
-*.egg-info/
-dist/
-build/
+.venv/
+venv/
 
-# Old script artifacts (no longer used)
-chrome_downloader_profile/
-temp_extension/
-downloaded_notes/
+# node
+node_modules/
 
-# Downloaded PDFs output
-downloads/
-
-# OS
-Thumbs.db
+# OS / editor
 .DS_Store
-
-# IDE
-.vscode/
-.idea/
-
-# Dev log (internal only)
-log-book.md
+Thumbs.db

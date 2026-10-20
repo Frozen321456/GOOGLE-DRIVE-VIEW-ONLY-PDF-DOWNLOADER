@@ -1,127 +1,128 @@
-# Google Drive View-Only PDF Downloader
+# GDrive PDF Fetcher
 
-A Python CLI tool that scrapes educational websites for Google Drive PDF links and **automatically downloads restricted/view-only PDFs** using headless browser preview capture. No manual browser interaction needed.
+Download Google Drive **view-only** PDFs by rendering the preview page and
+rebuilding it as a downloadable PDF. Free forever — Vercel + Render + Firebase
+Spark free tiers. PDFs are stored only in your browser (IndexedDB), never on
+a server.
 
-> [!IMPORTANT]
-> **MUST READ BEFORE USING:**
-> To use the fully automated headless download engine, you **MUST** run:
-> ```bash
-> playwright install chromium
-> ```
-> after installing the Python dependencies. Without it, the script will fall back to opening tabs in your browser for manual downloading.
+> Legal: only works on files you already have view access to. Respect
+> copyright — for personal offline use.
 
+## How it works
 
-## How It Works
+1. Paste a Drive link (or raw file ID) and hit **Download PDF**.
+2. The app checks your local cache (IndexedDB) first — cache hits download
+   instantly with zero backend calls.
+3. On a cache miss, the Render backend tries direct Drive endpoints first,
+   then falls back to headless Chromium: it opens the Drive preview page and
+   prints it back out as a real PDF.
+4. The blob is saved to your browser and downloaded. Metadata (status only)
+   goes to Firebase RTDB so the UI can show live progress.
 
-* **Subject Crawling Mode (Bulk):** Paste the URL of an educational website's index page. The script dynamically crawls and finds all unit/chapter sub-pages, scans them in parallel for Google Drive view-only PDF IDs, and downloads them in parallel.
-* **Direct Mode (Single PDF):** Paste a direct Google Drive viewer URL or file ID directly. The script detects it, bypasses the crawling/scanning phase, retrieves the document's real filename dynamically from the preview title page, and downloads the PDF immediately.
+## Repo layout
 
-### Why Headless Browser?
+```
+gdrive-pdf-fetcher/
+├── frontend/            # static site → Vercel
+│   ├── index.html       # UI (dark glassmorphism theme)
+│   ├── style.css
+│   ├── app.js           # download flow orchestration
+│   ├── db.js            # IndexedDB helpers
+│   ├── firebase-config.js
+│   └── vercel.json
+├── backend/             # Flask + Playwright → Render (Docker)
+│   ├── app.py           # /api/download, /api/health
+│   ├── downloader.py    # build_pdf(): direct HTTP → Chromium print
+│   ├── firebase_client.py
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── .env.example
+├── docs/                # PRD + TRD (build spec)
+└── firebase-database.rules.json
+```
 
-Many educational PDFs on Google Drive have **download restrictions** enabled by the owner. Standard tools (`gdown`, `curl`, `wget`) cannot download these files. This tool uses an invisible (headless) Chromium browser to:
-- Load the Google Drive preview page
-- Capture the rendered page images as Google scrolls through the document
-- Combine all page images into a proper PDF file
+## Setup
 
-## Prerequisites
+### 1. Firebase (RTDB status sync — optional but recommended)
 
-### 1. Install Python Dependencies
+1. console.firebase.google.com → create project.
+2. Build → Realtime Database → Create (test mode).
+3. Rules → paste `firebase-database.rules.json` (public read, no public write).
+4. Project settings → Service accounts → Generate new private key
+   (Database secrets admin) → base64-encode the JSON file:
+   `base64 -w0 service-account.json` (Linux) or
+   `base64 -i service-account.json` (macOS).
+5. Note the databaseURL (`https://PROJECT-default-rtdb.firebaseio.com`).
+
+### 2. Backend on Render
+
+1. render.com → New → Web Service → connect this repo → Root directory:
+   `backend` → Runtime: Docker → Instance: Free.
+2. Env vars:
+   - `ALLOWED_ORIGINS` = your Vercel URL (set after step 3)
+   - `FIREBASE_CREDENTIALS_JSON` = the base64 string from step 1
+   - `FIREBASE_DATABASE_URL` = your databaseURL
+3. Deploy → note `https://YOUR-BACKEND.onrender.com`.
+
+### 3. Frontend on Vercel
+
+1. vercel.com → Add New → Project → import this repo → Root directory:
+   `frontend` → Framework preset: Other.
+2. Env vars (values from Firebase console):
+   - `VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_AUTH_DOMAIN`,
+     `VITE_FIREBASE_DATABASE_URL`, `VITE_FIREBASE_PROJECT_ID`,
+     `VITE_FIREBASE_APP_ID`
+   - `VITE_BACKEND_URL` = `https://YOUR-BACKEND.onrender.com`
+3. Deploy → note `https://YOUR-APP.vercel.app`.
+
+### 4. Post-deploy wiring
+
+- Render: set `ALLOWED_ORIGINS` to your Vercel URL → redeploy.
+- Vercel: `VITE_BACKEND_URL` must already point at Render → redeploy.
+
+## Local development
+
+Frontend (any static server):
 
 ```bash
-pip install requests beautifulsoup4 playwright img2pdf Pillow
+cd frontend
+python3 -m http.server 5173
+# open http://localhost:5173
 ```
 
-### 2. Install Chromium for Playwright
+Backend (needs Python 3.11 + Playwright Chromium):
 
 ```bash
-playwright install chromium
+cd backend
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt && playwright install chromium
+cp .env.example .env   # fill values (or leave empty to skip RTDB sync)
+python app.py          # http://localhost:5000/api/health
 ```
 
-> This downloads a Chromium browser binary (~150MB, one-time). It runs invisibly — no browser window opens during download.
+## API
 
-### 3. Browser Fallback (Optional)
+| Endpoint | Method | Body | Returns |
+|---|---|---|---|
+| `/api/download` | POST | `{ "url": "<drive url>" }` or `{ "fileId": "<id>" }` | `application/pdf` blob |
+| `/api/health` | GET | — | `{ "status": "ok", "timestamp": ... }` |
 
-If any PDFs fail to auto-download, the tool offers to open them in **Brave** browser where you can use the [Document Preview Exporter](https://chromewebstore.google.com/detail/document-preview-exporter/npapjbliocdhineglcjkmmmaddpgeono) extension to save them manually.
+Error JSON: `{ "error": "message", "code": "INVALID_URL" |
+"NOT_ACCESSIBLE" | "RENDER_FAILED" }`.
 
-## Usage
+## Known limitations
 
-```bash
-python downloader.py
-```
+- **Render cold start:** after ~15 min idle the first request takes ~60s.
+  The UI shows a "waking server" state; ping `/api/health` on a schedule to
+  keep it warm (optional; watch free tier hours).
+- **512MB RAM:** very large PDFs may fail; there is a 100MB response guard.
+- **No server-side persistence:** every uncached fetch re-renders.
+- **Cache is per-browser:** IndexedDB does not sync across devices.
+- **No auth (v1):** the app is public; add Firebase Auth in v2.
+- **View-only means view-only-ish:** if the owner revokes access or the file
+  is DRM-protected, this will fail with NOT_ACCESSIBLE.
 
-You can paste either:
-1. An index page or section page (e.g. Nasar, Nazam, Ghazal, Grammar, Units/Lessons) to automatically crawl and download all related units/parts.
-2. Multiple URLs or a markdown link list containing multiple sections or units.
-3. A direct Google Drive sharing link (e.g. `https://drive.google.com/file/d/.../view`).
-4. An exact Google Drive file ID (e.g. `1nDKKBVuYK-4PZsgT9EbydLl5VDxuct05`).
-5. A `.txt` file containing URLs.
+## Docs
 
-### Example Output
-
-```
-============================================================
-📚 GOOGLE DRIVE VIEW-ONLY PDF DOWNLOADER
-============================================================
-
-🔗 Enter the main page URL: https://example.com/class-10-notes/english/
-
-📥 Fetching: https://example.com/class-10-notes/english/
-✅ Found 12 unit/chapter pages.
-
-📂 Found 12 pages to scan:
-  [1] unit-1
-  [2] unit-2
-  ...
-
-🔍 Scanning pages for Google Drive PDFs...
-  ✅ unit-1: 1 PDF(s)
-  ✅ unit-2: 1 PDF(s)
-  ...
-
-📊 Total unique PDFs found: 12
-📂 Output folder: downloads/class-10-english/
-
-⬇️  Downloading 12 PDFs (3 at a time)...
-  ✅ [1/12] unit-1.pdf (15 pages)
-  ✅ [2/12] unit-2.pdf (8 pages)
-  ⬇️  [3/12] unit-3.pdf downloading...
-  ...
-
-🎉 Done! 12/12 PDFs saved to downloads/class-10-english/
-```
-
-### Multi-Level Navigation
-
-If the URL is a landing page with multiple subjects, the script shows a selection menu:
-
-```
-📂 Found 5 subject pages:
-  1. English
-  2. Math
-  3. Science
-  4. Urdu
-  5. Pakistan Studies
-  6. ALL subjects
-
-Select (1-6):
-```
-
-## Project Structure
-
-```
-textbook_downloader/
-├── downloader.py      # Main script (crawl + headless download)
-├── requirements.txt   # Python dependencies
-├── downloads/         # Auto-created output folder
-├── log-book.md        # Development log
-├── LICENSE            # MIT License
-└── README.md          # This file
-```
-
-## Fallback Mode
-
-If `playwright`/`img2pdf`/`Pillow` are not installed, the tool falls back to the old behavior: opening all PDF links as tabs in Brave browser for manual download using the Document Preview Exporter extension.
-
-## License
-
-MIT License — see [LICENSE](LICENSE) for details.
+- [docs/PRD.md](docs/PRD.md) — product requirements
+- [docs/TRD.md](docs/TRD.md) — technical spec, deployment pipeline, error codes

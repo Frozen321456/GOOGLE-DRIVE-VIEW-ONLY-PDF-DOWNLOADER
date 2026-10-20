@@ -1,0 +1,10 @@
+{
+  "rules": {
+    "pdfs": {
+      "$fileId": {
+        ".read": true,
+        ".write": false
+      }
+    }
+  }
+}
