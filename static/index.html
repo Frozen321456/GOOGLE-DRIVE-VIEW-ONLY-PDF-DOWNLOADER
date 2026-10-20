@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GDrive View-Only PDF Downloader</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    }
+
+    body {
+      min-height: 100vh;
+      background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 720px;
+      background: rgba(255, 255, 255, 0.06);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 24px;
+      padding: 2.5rem 2rem;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
+      transition: 0.3s ease;
+    }
+
+    h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      background: linear-gradient(to right, #a78bfa, #38bdf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: 0.5rem;
+      text-align: center;
+    }
+
+    .subtitle {
+      text-align: center;
+      color: #94a3b8;
+      font-size: 0.9rem;
+      margin-bottom: 2rem;
+      line-height: 1.5;
+    }
+
+    .input-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      margin-bottom: 1.5rem;
+    }
+
+    label {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #cbd5e1;
+      letter-spacing: 0.3px;
+    }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 0.9rem 1rem;
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 12px;
+      color: #f1f5f9;
+      font-size: 1rem;
+      outline: none;
+      transition: 0.2s;
+    }
+
+    input[type="text"]:focus {
+      border-color: #6366f1;
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25);
+    }
+
+    input[type="text"]::placeholder {
+      color: #64748b;
+    }
+
+    .btn {
+      width: 100%;
+      padding: 0.9rem;
+      border: none;
+      border-radius: 12px;
+      font-size: 1rem;
+      font-weight: 700;
+      cursor: pointer;
+      background: linear-gradient(135deg, #6366f1, #8b5cf6);
+      color: #fff;
+      transition: 0.25s;
+      letter-spacing: 0.3px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+    }
+
+    .btn:hover:not(:disabled) {
+      background: linear-gradient(135deg, #4f46e5, #7c3aed);
+      transform: translateY(-2px);
+      box-shadow: 0 10px 20px -5px rgba(99, 102, 241, 0.5);
+    }
+
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .status-area {
+      margin-top: 1.5rem;
+      background: rgba(0, 0, 0, 0.25);
+      border-radius: 12px;
+      padding: 1.2rem;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      min-height: 80px;
+    }
+
+    .status-text {
+      font-size: 0.9rem;
+      color: #cbd5e1;
+      margin-bottom: 0.6rem;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .progress-bar-container {
+      width: 100%;
+      height: 8px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 99px;
+      overflow: hidden;
+      margin-top: 0.5rem;
+    }
+
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #6366f1, #38bdf8);
+      border-radius: 99px;
+      transition: width 0.3s ease;
+    }
+
+    .log-box {
+      margin-top: 1rem;
+      max-height: 180px;
+      overflow-y: auto;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.8rem;
+      line-height: 1.6;
+      color: #94a3b8;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 8px;
+      padding: 0.8rem;
+      display: none;
+    }
+
+    .log-box.visible {
+      display: block;
+    }
+
+    .log-box::-webkit-scrollbar {
+      width: 6px;
+    }
+
+    .log-box::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.2);
+      border-radius: 99px;
+    }
+
+    .spinner {
+      width: 18px;
+      height: 18px;
+      border: 2px solid rgba(255, 255, 255, 0.3);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    .error {
+      color: #f87171;
+    }
+
+    .success {
+      color: #4ade80;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <h1>GDrive PDF Downloader</h1>
+    <p class="subtitle">
+      Paste a Google Drive view-only PDF link or file ID.<br>
+      The backend will capture preview renders and build your PDF.
+    </p>
+
+    <div class="input-group">
+      <label for="urlInput">Google Drive URL / File ID</label>
+      <input
+        type="text"
+        id="urlInput"
+        placeholder="https://drive.google.com/file/d/.../view  or  1nDKKBVuYK-4PZsgT9EbydLl5VDxuct05"
+        autocomplete="off"
+      >
+    </div>
+
+    <button class="btn" id="downloadBtn">
+      ⬇ Download PDF
+    </button>
+
+    <div class="status-area" id="statusArea">
+      <div class="status-text" id="statusText">
+        ⏳ Waiting for input...
+      </div>
+      <div class="progress-bar-container">
+        <div class="progress-bar" id="progressBar"></div>
+      </div>
+      <div class="log-box" id="logBox"></div>
+    </div>
+  </div>
+
+  <script>
+    const urlInput = document.getElementById('urlInput');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const statusText = document.getElementById('statusText');
+    const progressBar = document.getElementById('progressBar');
+    const logBox = document.getElementById('logBox');
+
+    function setStatus(message, type = 'info') {
+      const icons = {
+        info: 'ℹ️',
+        success: '✅',
+        error: '❌',
+        loading: '⏳'
+      };
+      statusText.innerHTML = `${icons[type] || ''} ${message}`;
+      statusText.className = 'status-text' + (type === 'error' ? ' error' : type === 'success' ? ' success' : '');
+    }
+
+    function setProgress(percent) {
+      progressBar.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+    }
+
+    function appendLog(line) {
+      logBox.classList.add('visible');
+      const div = document.createElement('div');
+      div.textContent = `> ${line}`;
+      logBox.appendChild(div);
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function resetUI() {
+      setProgress(0);
+      logBox.innerHTML = '';
+      logBox.classList.remove('visible');
+    }
+
+    async function handleDownload() {
+      const input = urlInput.value.trim();
+
+      if (!input) {
+        setStatus('Please enter a Google Drive link or file ID.', 'error');
+        return;
+      }
+
+      // Basic validation (optional)
+      const isDriveUrl = input.includes('drive.google.com');
+      const isFileId = /^[a-zA-Z0-9_-]{10,}$/.test(input); // rough check
+
+      if (!isDriveUrl && !isFileId) {
+        setStatus('Invalid input. Please provide a Drive link or file ID.', 'error');
+        return;
+      }
+
+      resetUI();
+      downloadBtn.disabled = true;
+      downloadBtn.innerHTML = '<span class="spinner"></span> Processing...';
+      setStatus('Starting download...', 'loading');
+      setProgress(10);
+
+      try {
+        // ------------------------------------------------------------
+        // BACKEND ENDPOINT – adjust this URL to your Flask/FastAPI server
+        // ------------------------------------------------------------
+        const response = await fetch('/api/download', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: input }),
+        });
+
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.error || `Server error: ${response.status}`);
+        }
+
+        const result = await response.json();
+
+        // Assume backend returns: { success: true, file: "filename.pdf", logs: [...] }
+        setProgress(100);
+
+        if (result.success) {
+          setStatus('Download complete! Your PDF is ready.', 'success');
+          if (result.logs && Array.isArray(result.logs)) {
+            result.logs.forEach(appendLog);
+          }
+          if (result.file) {
+            // Optionally trigger download of the generated file
+            const a = document.createElement('a');
+            a.href = `/downloads/${encodeURIComponent(result.file)}`; // adjust path
+            a.download = result.file;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+          }
+        } else {
+          setStatus(result.error || 'Download failed. Check logs.', 'error');
+          if (result.logs) {
+            result.logs.forEach(appendLog);
+          }
+        }
+      } catch (err) {
+        setStatus(`Error: ${err.message}`, 'error');
+        appendLog(err.message);
+        setProgress(0);
+      } finally {
+        downloadBtn.disabled = false;
+        downloadBtn.innerHTML = '⬇ Download PDF';
+      }
+    }
+
+    downloadBtn.addEventListener('click', handleDownload);
+    urlInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') handleDownload();
+    });
+  </script>
+
+</body>
+</html>
