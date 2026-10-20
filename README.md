@@ -37,6 +37,11 @@ gdrive-pdf-fetcher/
 │   ├── requirements.txt
 │   ├── Dockerfile
 │   └── .env.example
+├── cli/                 # original CLI tool (preserved, see below)
+│   ├── app.py           # interactive CLI entry
+│   ├── downloader.py    # crawler + headless capture engine
+│   ├── requirements.txt
+│   └── static/index.html
 ├── docs/                # PRD + TRD (build spec)
 └── firebase-database.rules.json
 ```
@@ -121,6 +126,22 @@ Error JSON: `{ "error": "message", "code": "INVALID_URL" |
 - **No auth (v1):** the app is public; add Firebase Auth in v2.
 - **View-only means view-only-ish:** if the owner revokes access or the file
   is DRM-protected, this will fail with NOT_ACCESSIBLE.
+
+## CLI tool (v0, preserved)
+
+Before this web app, this repo shipped a Python CLI that scrapes educational
+sites for Drive PDF links and captures view-only PDFs via headless Chromium
+(scroll-capture → img2pdf). It still works standalone:
+
+```bash
+cd cli
+pip install -r requirements.txt && playwright install chromium
+python app.py
+```
+
+See [cli/README.md](cli/README.md) for its full guide. The web app in
+`frontend/` + `backend/` is the successor (single-link web flow, browser
+caching, deployable free-tier stack); the CLI keeps its bulk-crawler niche.
 
 ## Docs
 

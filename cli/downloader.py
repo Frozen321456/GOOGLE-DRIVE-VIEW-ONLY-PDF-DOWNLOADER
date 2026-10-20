@@ -1,0 +1,792 @@
+"""
+Google Drive View-Only PDF Downloader
+
+Scrapes educational websites for Google Drive PDF links,
+then downloads restricted/view-only PDFs automatically using
+headless browser preview capture. No manual browser interaction needed.
+
+Usage:
+    python downloader.py
+
+Dependencies:
+    pip install requests beautifulsoup4 playwright img2pdf Pillow
+    playwright install chromium
+"""
+
+import re
+import os
+import sys
+import subprocess
+import asyncio
+import concurrent.futures
+import io
+from pathlib import Path
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urljoin
+
+# Optional headless download dependencies
+try:
+    from playwright.async_api import async_playwright
+    import img2pdf
+    from PIL import Image
+    HEADLESS_AVAILABLE = True
+except ImportError:
+    HEADLESS_AVAILABLE = False
+
+# UTF-8 emoji support on Windows
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+
+MAX_CONCURRENT_DOWNLOADS = 3
+DOWNLOAD_DIR = "downloads"
+
+
+# ==================== UTILITIES ====================
+
+UNIT_SECTION_WORDS = {
+    'unit', 'chapter', 'chap', 'lec', 'lecture', 'exercise', 'part',
+    'lesson', 'story', 'stories', 'essay', 'essays', 'letter', 'letters',
+    'application', 'applications', 'dialogue', 'dialogues', 'nazam', 'nazm',
+    'ghazal', 'gazal', 'nasar', 'nasr', 'grammar', 'qawaid', 'khulasa',
+    'khatoot', 'mukalma', 'kahani', 'darkhwast', 'rubaiyat',
+    'qataat', 'poetry', 'prose', 'comprehension', 'mcq', 'mcqs'
+}
+
+UNIT_RE = re.compile(
+    r'(unit|chapter|chap|lec|exercise|part|lesson|story|stories|essay|essays|letter|letters|application|applications|dialogue|dialogues|nazam|nazm|ghazal|gazal|nasar|nasr|grammar|qawaid|khulasa|khatoot|mukalma|kahani|darkhwast|aap-?beeti|rubaiyat|qataat|poetry|prose|comprehension|mcq|mcqs)',
+    re.I
+)
+
+
+def extract_keywords(url, include_units=False):
+    """Extract meaningful keywords from URL path for matching."""
+    path = urlparse(url).path.strip('/')
+    words = re.findall(r'[a-zA-Z0-9]+', path.lower())
+
+    stop_words = {
+        'for', 'and', 'the', 'to', 'a', 'in', 'of', 'with', 'by', 'on', 'at',
+        'from', 'an', 'is', 'are', 'notes', 'key', 'books', 'solved', 'exercises',
+        'solutions', 'guide', 'class', 'schools', 'colleges', 'level', 'primary',
+        'middle', 'elementary', 'secondary', 'higher', 'study', 'material',
+        'download', 'free', 'pdf', 'board', 'boards', 'post', 'category',
+        'wp', 'content', 'uploads'
+    }
+    if not include_units:
+        stop_words.update(UNIT_SECTION_WORDS)
+
+    keywords = set()
+    for w in words:
+        # Normalize "5th" -> "5"
+        m = re.match(r'^(\d+)(?:st|nd|rd|th)?$', w)
+        norm = m.group(1) if m else w
+        norm = norm.lstrip('0') or '0'
+        # Do not include pure digits or stop words in general subject keywords
+        if norm.isdigit():
+            continue
+        if norm not in stop_words and len(norm) > 1:
+            keywords.add(norm)
+    return keywords
+
+
+def natural_sort_key(s):
+    """Sort strings with embedded numbers naturally (Unit 2 before Unit 10)."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+
+
+def derive_folder_name(url):
+    """Create a clean folder name from URL path keywords."""
+    path = urlparse(url).path.strip('/')
+    words = re.findall(r'[a-zA-Z0-9]+', path.lower())
+    skip = {
+        'www', 'com', 'net', 'org', 'http', 'https', 'wp',
+        'content', 'post', 'category', 'html', 'php'
+    }
+    name = '-'.join(w for w in words if w not in skip and len(w) > 1)
+    return name[:80] or 'drive-pdfs'
+
+
+def parse_urls(input_text):
+    """Extract all HTTP/Drive URLs from raw input text (including markdown links)."""
+    # Check if input is a text file path
+    if os.path.isfile(input_text.strip()):
+        try:
+            with open(input_text.strip(), 'r', encoding='utf-8') as f:
+                input_text = f.read()
+        except Exception:
+            pass
+
+    urls = re.findall(r'https?://[^\s)\]"\'>]+', input_text)
+    if not urls:
+        bare_id = input_text.strip()
+        if re.match(r'^[a-zA-Z0-9_-]{25,}$', bare_id):
+            return [bare_id]
+    cleaned = []
+    seen = set()
+    for u in urls:
+        u = u.rstrip('.,;)]\'"')
+        if u and u not in seen:
+            seen.add(u)
+            cleaned.append(u)
+    return cleaned
+
+
+# ==================== CRAWL & DETECT SUB-PAGES ====================
+
+def crawl_page(index_url):
+    """
+    Crawl the main page.
+    Auto-detects unit/chapter/nazam/ghazal/grammar pages or subject-level pages.
+    Returns a list of content page URLs to scan for Drive PDFs.
+    """
+    print(f"\n📥 Fetching: {index_url}")
+    try:
+        resp = requests.get(index_url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return [index_url] if index_url.startswith("http") else []
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    content = soup.find(class_='entry-content') or soup.find('body') or soup
+    target_keywords = extract_keywords(index_url)
+    domain = urlparse(index_url).netloc
+
+    # Collect unique links
+    seen = set()
+    links = []
+    for a in content.find_all('a'):
+        href = a.get('href')
+        if not href:
+            continue
+        href = urljoin(index_url, href)
+        href = urlparse(href)._replace(query="", fragment="").geturl()
+        if href not in seen:
+            seen.add(href)
+            text = re.sub(r'\s+', ' ', (a.text or '').replace('\n', ' ').strip())
+            links.append((href, text))
+
+    # Filter junk
+    skip = ['facebook.com', 'twitter.com', 'youtube.com', 'wa.me',
+            'about-us', 'contact-us', 'privacy-policy', 'blog',
+            'find-home-tutors', 'academic-notes-contribution', 'online-digital-services']
+
+    unit_candidates = []
+    subject_candidates = []
+
+    # If the index_url itself is a unit/chapter/section page, include it
+    index_path = urlparse(index_url).path.strip('/')
+    if UNIT_RE.search(index_path):
+        unit_candidates.append((index_url, ""))
+
+    for href, text in links:
+        if not href.startswith('http') or domain not in href:
+            continue
+        if any(x in href.lower() for x in skip):
+            continue
+        if href.rstrip('/') == index_url.rstrip('/'):
+            continue
+
+        path = urlparse(href).path.strip('/')
+        is_unit = bool(UNIT_RE.search(path)) or bool(UNIT_RE.search(text))
+        cand_keywords = extract_keywords(href)
+        score = len(target_keywords & cand_keywords)
+
+        if target_keywords and score >= len(target_keywords):
+            (unit_candidates if is_unit else subject_candidates).append((href, text))
+        elif not target_keywords and is_unit:
+            unit_candidates.append((href, text))
+
+    # Case 1: Found unit pages directly
+    if unit_candidates:
+        urls = sorted(list(set(h for h, _ in unit_candidates)), key=natural_sort_key)
+        print(f"✅ Found {len(urls)} unit/section pages.")
+        return urls
+
+    # Case 2: Found subject pages — let user pick
+    if subject_candidates:
+        subject_candidates = sorted(list(set(subject_candidates)), key=lambda x: x[1])
+        print(f"\n📂 Found {len(subject_candidates)} subject pages:")
+        for i, (href, text) in enumerate(subject_candidates, 1):
+            print(f"  {i}. {text or '(no label)'}")
+        print(f"  {len(subject_candidates) + 1}. ALL subjects")
+
+        while True:
+            choice = input(f"\nSelect (1-{len(subject_candidates) + 1}): ").strip()
+            if choice.isdigit():
+                idx = int(choice)
+                if 1 <= idx <= len(subject_candidates):
+                    return crawl_page(subject_candidates[idx - 1][0])
+                elif idx == len(subject_candidates) + 1:
+                    all_units = []
+                    for url, _ in subject_candidates:
+                        all_units.extend(crawl_page(url))
+                    return sorted(list(set(all_units)), key=natural_sort_key)
+            print("❌ Invalid choice.")
+
+    # Case 3: Fallback — any unit-like links with lower match threshold
+    fallback = []
+    if UNIT_RE.search(index_path):
+        fallback.append(index_url)
+
+    for href, text in links:
+        if not href.startswith('http') or domain not in href:
+            continue
+        if any(x in href.lower() for x in skip):
+            continue
+        if href.rstrip('/') == index_url.rstrip('/'):
+            continue
+        if UNIT_RE.search(urlparse(href).path) or UNIT_RE.search(text or ''):
+            fallback.append(href)
+
+    if fallback:
+        urls = sorted(list(set(fallback)), key=natural_sort_key)
+        print(f"⚠️ Fallback: found {len(urls)} potential pages.")
+        return urls
+
+    # If no sub-links were found, treat the page itself as the target content page
+    return [index_url]
+
+
+# ==================== SCAN FOR GOOGLE DRIVE IDS ====================
+
+DRIVE_PATTERNS = [
+    re.compile(r'/d/([a-zA-Z0-9_-]{25,})'),
+    re.compile(r'id=([a-zA-Z0-9_-]{25,})'),
+]
+
+
+def scan_for_drive_ids(url):
+    """Scan a page's HTML for Google Drive file IDs."""
+    found = set()
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=12)
+        if resp.status_code != 200:
+            return url, found
+
+        html = resp.text
+        for p in DRIVE_PATTERNS:
+            found.update(p.findall(html))
+
+        # Also check iframes
+        soup = BeautifulSoup(html, 'html.parser')
+        for iframe in soup.find_all('iframe'):
+            src = iframe.get('src', '')
+            if 'drive.google.com' in src:
+                for p in DRIVE_PATTERNS:
+                    found.update(p.findall(src))
+    except Exception:
+        pass
+    return url, found
+
+
+# ==================== PDF DOWNLOAD ENGINE ====================
+
+async def capture_single_pdf(context, file_id, output_path, label=""):
+    """
+    Capture a Google Drive PDF by loading the preview in a headless browser
+    and intercepting the rendered page images from network responses.
+
+    Uses scroll-position detection to stop at the document end, and two-stage
+    deduplication (dimension grouping + perceptual hash with hamming tolerance)
+    to produce exactly one image per page.
+
+    Returns (success: bool, page_count: int, error_message: str|None)
+    """
+    page = await context.new_page()
+    # Use dict keyed by URL so re-fetches of the same image overwrite
+    captured_by_url = {}
+
+    async def on_response(response):
+        """Intercept image responses — these are the rendered PDF pages."""
+        try:
+            ct = response.headers.get("content-type", "")
+            is_image = any(t in ct for t in ["image/jpeg", "image/png", "image/webp"])
+            if response.status == 200 and is_image:
+                body = await response.body()
+                # Page renders are large (>10KB), icons/UI are tiny
+                if len(body) > 10_000:
+                    captured_by_url[response.url] = body
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+
+    try:
+        # Navigate to the Google Drive viewer
+        await page.goto(
+            f"https://drive.google.com/file/d/{file_id}/view",
+            wait_until="domcontentloaded",
+            timeout=60000
+        )
+
+        # Wait for the viewer to initialize and render the first pages
+        await page.wait_for_timeout(5000)
+
+        # Check if we landed on a login page or access denied
+        page_title = await page.title()
+        page_url = page.url
+        if "accounts.google.com" in page_url:
+            return False, 0, "Requires Google login"
+        if "denied" in page_title.lower() or "not found" in page_title.lower():
+            return False, 0, "Access denied or file not found"
+
+        # Clean title to get a safe filename (e.g. "Unit 01.pdf - Google Drive" -> "Unit 01.pdf")
+        filename_title = page_title
+        if " - Google Drive" in filename_title:
+            filename_title = filename_title.replace(" - Google Drive", "")
+        if filename_title.lower().endswith(".pdf"):
+            filename_title = filename_title[:-4]
+        filename_title = re.sub(r'[\\/*?:"<>|]', "", filename_title).strip()
+        if not filename_title:
+            filename_title = "document"
+
+        # Scroll through all pages to trigger lazy-loading of images.
+        # Stop when the SCROLL POSITION stops changing (= reached the bottom).
+        # We scroll via JS on the dynamic container, which works headlessly.
+        stable_rounds = 0
+
+        for _ in range(300):  # Safety limit
+            # Get scroll position BEFORE scrolling
+            scroll_before = await page.evaluate('''() => {
+                const findScrollContainer = () => {
+                    const doc = document.querySelector('[role="document"]');
+                    if (doc) {
+                        let parent = doc;
+                        while (parent) {
+                            if (parent.scrollHeight > parent.clientHeight + 10) {
+                                const style = window.getComputedStyle(parent);
+                                if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                    return parent;
+                                }
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+                    const divs = Array.from(document.querySelectorAll('div'));
+                    let best = null;
+                    let maxScroll = 0;
+                    for (const div of divs) {
+                        if (div.scrollHeight > div.clientHeight + 50) {
+                            const style = window.getComputedStyle(div);
+                            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                if (div.scrollHeight > maxScroll) {
+                                    maxScroll = div.scrollHeight;
+                                    best = div;
+                                }
+                            }
+                        }
+                    }
+                    return best || document.documentElement;
+                };
+                const c = findScrollContainer();
+                return c ? c.scrollTop : 0;
+            }''')
+
+            # Scroll down by clientHeight * 0.8
+            await page.evaluate('''() => {
+                const findScrollContainer = () => {
+                    const doc = document.querySelector('[role="document"]');
+                    if (doc) {
+                        let parent = doc;
+                        while (parent) {
+                            if (parent.scrollHeight > parent.clientHeight + 10) {
+                                const style = window.getComputedStyle(parent);
+                                if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                    return parent;
+                                }
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+                    const divs = Array.from(document.querySelectorAll('div'));
+                    let best = null;
+                    let maxScroll = 0;
+                    for (const div of divs) {
+                        if (div.scrollHeight > div.clientHeight + 50) {
+                            const style = window.getComputedStyle(div);
+                            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                if (div.scrollHeight > maxScroll) {
+                                    maxScroll = div.scrollHeight;
+                                    best = div;
+                                }
+                            }
+                        }
+                    }
+                    return best || document.documentElement;
+                };
+                const c = findScrollContainer();
+                if (c) {
+                    c.scrollTop += c.clientHeight * 0.8;
+                }
+            }''')
+            
+            await page.wait_for_timeout(1000)
+
+            # Get scroll position AFTER
+            scroll_after = await page.evaluate('''() => {
+                const findScrollContainer = () => {
+                    const doc = document.querySelector('[role="document"]');
+                    if (doc) {
+                        let parent = doc;
+                        while (parent) {
+                            if (parent.scrollHeight > parent.clientHeight + 10) {
+                                const style = window.getComputedStyle(parent);
+                                if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                    return parent;
+                                }
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+                    const divs = Array.from(document.querySelectorAll('div'));
+                    let best = null;
+                    let maxScroll = 0;
+                    for (const div of divs) {
+                        if (div.scrollHeight > div.clientHeight + 50) {
+                            const style = window.getComputedStyle(div);
+                            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                if (div.scrollHeight > maxScroll) {
+                                    maxScroll = div.scrollHeight;
+                                    best = div;
+                                }
+                            }
+                        }
+                    }
+                    return best || document.documentElement;
+                };
+                const c = findScrollContainer();
+                return c ? c.scrollTop : 0;
+            }''')
+
+            if scroll_after == scroll_before:
+                stable_rounds += 1
+                # Scroll position unchanged for 5 consecutive tries = at bottom
+                if stable_rounds >= 5:
+                    break
+            else:
+                stable_rounds = 0
+
+        # Final wait for any in-flight image responses
+        await page.wait_for_timeout(3000)
+
+    except Exception as e:
+        return False, 0, str(e)
+    finally:
+        page.remove_listener("response", on_response)
+        await page.close()
+
+    if not captured_by_url:
+        return False, 0, "No page images captured from preview"
+
+    # === DEDUPLICATION & PAGE ASSEMBLY ===
+    import urllib.parse
+    import hashlib
+
+    # Group images by URL page parameter
+    pages_by_num = {}  # int -> bytes
+    unpageable_images = []  # list of bytes for images that don't have page= query param
+
+    raw_count = len(captured_by_url)
+
+    for url, img_bytes in captured_by_url.items():
+        try:
+            # Check dimensions to skip icons
+            img = Image.open(io.BytesIO(img_bytes))
+            if img.width < 200 or img.height < 200:
+                continue
+        except Exception:
+            continue
+
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+
+        if 'page' in qs:
+            try:
+                page_num = int(qs['page'][0])
+                # Keep the largest file (highest quality/resolution) for this page number
+                if page_num not in pages_by_num or len(img_bytes) > len(pages_by_num[page_num]):
+                    pages_by_num[page_num] = img_bytes
+            except ValueError:
+                unpageable_images.append(img_bytes)
+        else:
+            unpageable_images.append(img_bytes)
+
+    unique_pages = []
+
+    if pages_by_num:
+        # Reconstruct PDF using the sorted page numbers
+        sorted_page_nums = sorted(pages_by_num.keys())
+        for p_num in sorted_page_nums:
+            unique_pages.append(pages_by_num[p_num])
+        print(f"  🔍 [{label}] Dedup: grouped by URL page parameter. Captured: {raw_count} | Unique: {len(unique_pages)}")
+    else:
+        # Fallback to byte-identical deduplication (MD5) as suggested in senior review
+        seen_hashes = set()
+        for img_bytes in unpageable_images:
+            try:
+                img_hash = hashlib.md5(img_bytes).hexdigest()
+                if img_hash not in seen_hashes:
+                    seen_hashes.add(img_hash)
+                    unique_pages.append(img_bytes)
+            except Exception:
+                continue
+        print(f"  🔍 [{label}] Dedup: fallback (MD5 hashing). Captured: {raw_count} | Unique: {len(unique_pages)}")
+
+    if not unique_pages:
+        return False, 0, "No unique page images found"
+
+    # Process page images: convert to RGB JPEG
+    processed = []
+    resolutions = []
+    for img_bytes in unique_pages:
+        try:
+            img = Image.open(io.BytesIO(img_bytes))
+            resolutions.append(f"{img.width}x{img.height}")
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=95)
+            processed.append(buf.getvalue())
+        except Exception:
+            continue
+
+    if not processed:
+        return False, 0, "Captured images could not be processed"
+
+    # Report page resolutions for validation
+    res_summary = ", ".join(set(resolutions))
+    print(f"  📊 [{label}] Compiled {len(processed)} pages (resolutions: {res_summary})")
+
+    # Combine all page images into a single PDF
+    if label == "document" and 'filename_title' in locals():
+        output_path = output_path.parent / f"{filename_title}.pdf"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'wb') as f:
+        f.write(img2pdf.convert(processed))
+
+    print(f"  ✅ Saved: {output_path.name}")
+    return True, len(processed), None
+
+
+async def download_all_pdfs(file_entries, output_dir):
+    """
+    Download multiple Drive PDFs in parallel using async headless browsers.
+
+    Args:
+        file_entries: list of (file_id, display_name) tuples
+        output_dir: path to save downloaded PDFs
+
+    Returns:
+        list of (name, file_id, success, error) result tuples
+    """
+    total = len(file_entries)
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1200},
+            user_agent=HEADERS["User-Agent"],
+        )
+
+        async def process_one(index, file_id, name):
+            async with semaphore:
+                output_path = Path(output_dir) / f"{name}.pdf"
+                print(f"  ⬇️  [{index}/{total}] {name} downloading...")
+
+                success, pages, error = await capture_single_pdf(
+                    context, file_id, output_path, name
+                )
+
+                if success:
+                    print(f"  ✅ [{index}/{total}] {name}.pdf ({pages} pages)")
+                else:
+                    print(f"  ❌ [{index}/{total}] {name} — {error}")
+
+                return (name, file_id, success, error)
+
+        tasks = [
+            process_one(i + 1, fid, name)
+            for i, (fid, name) in enumerate(file_entries)
+        ]
+
+        results = await asyncio.gather(*tasks)
+        await browser.close()
+
+    return list(results)
+
+
+# ==================== BRAVE FALLBACK ====================
+
+def find_brave():
+    """Find Brave browser executable on Windows."""
+    candidates = [
+        os.path.join(os.environ.get('PROGRAMFILES', ''), 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+        os.path.join(os.environ.get('PROGRAMFILES(X86)', ''), 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+def open_failures_in_brave(failed_results):
+    """Open failed Drive file URLs in Brave as manual fallback."""
+    brave = find_brave()
+    urls = [f"https://drive.google.com/file/d/{fid}/view" for _, fid, _, _ in failed_results]
+
+    if not brave:
+        print("❌ Brave not found! Opening in default browser instead...")
+        import webbrowser
+        for url in urls:
+            webbrowser.open(url)
+        return
+
+    print(f"\n🌐 Opening {len(urls)} failed PDFs in Brave...")
+    subprocess.Popen([brave] + urls)
+    print("✅ Tabs opened! Use your Document Preview Exporter extension to download each PDF.")
+
+
+# ==================== MAIN ====================
+
+def main():
+    print("=" * 60)
+    print("📚 GOOGLE DRIVE VIEW-ONLY PDF DOWNLOADER")
+    print("=" * 60)
+
+    if not HEADLESS_AVAILABLE:
+        print("\n⚠️  Headless download dependencies not found!")
+        print("  Install with:")
+        print("    pip install playwright img2pdf Pillow")
+        print("    playwright install chromium")
+        print("\n  Falling back to browser-only mode (opens tabs in Brave).\n")
+
+    user_input = input("\n🔗 Enter page URL(s), markdown links, or text file: ").strip()
+    if not user_input:
+        print("❌ No URL provided. Exiting.")
+        return
+
+    raw_urls = parse_urls(user_input)
+    if not raw_urls:
+        print("❌ No valid URLs or Drive IDs found. Exiting.")
+        return
+
+    file_entries = []  # (file_id, display_name)
+    seen_ids = set()
+    pages_to_scan = set()
+
+    for item in raw_urls:
+        # Check if direct Google Drive link or file ID
+        direct_id = None
+        if "drive.google.com" in item:
+            for pattern in DRIVE_PATTERNS:
+                m = pattern.search(item)
+                if m:
+                    direct_id = m.group(1)
+                    break
+        elif re.match(r'^[a-zA-Z0-9_-]{25,}$', item):
+            direct_id = item
+
+        if direct_id:
+            if direct_id not in seen_ids:
+                seen_ids.add(direct_id)
+                file_entries.append((direct_id, f"drive-doc-{len(file_entries) + 1}"))
+        else:
+            # Crawl page or add directly
+            sub_pages = crawl_page(item)
+            for p in sub_pages:
+                pages_to_scan.add(p)
+
+    # Scan collected content pages for Google Drive file IDs
+    if pages_to_scan:
+        sorted_pages = sorted(list(pages_to_scan), key=natural_sort_key)
+        print(f"\n📂 Total {len(sorted_pages)} page(s) to scan:")
+        for i, p in enumerate(sorted_pages, 1):
+            print(f"  [{i}] {p.rstrip('/').split('/')[-1]}")
+
+        print("\n🔍 Scanning pages for Google Drive PDFs...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(scan_for_drive_ids, p): p for p in sorted_pages}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    scanned_url, ids = future.result()
+                    name = scanned_url.rstrip('/').split('/')[-1]
+                    if ids:
+                        print(f"  ✅ {name}: {len(ids)} PDF(s)")
+                        for j, fid in enumerate(sorted(ids)):
+                            if fid not in seen_ids:
+                                seen_ids.add(fid)
+                                suffix = f"-{j + 1}" if len(ids) > 1 else ""
+                                file_entries.append((fid, f"{name}{suffix}"))
+                    else:
+                        print(f"  ⚠️ {name}: no PDFs found")
+                except Exception as e:
+                    print(f"  ❌ Error: {e}")
+
+    if not file_entries:
+        print("\n❌ No Google Drive PDFs found. Exiting.")
+        return
+
+    # Sort entries naturally by name
+    file_entries.sort(key=lambda x: natural_sort_key(x[1]))
+    folder_name = derive_folder_name(raw_urls[0] if raw_urls else "drive-pdfs")
+
+    print(f"\n📊 Total unique PDFs found: {len(file_entries)}")
+
+    # Step 3: Download or open in browser
+    if HEADLESS_AVAILABLE:
+        output_dir = os.path.join(DOWNLOAD_DIR, folder_name)
+        print(f"📂 Output folder: {output_dir}/")
+        print(f"\n⬇️  Downloading {len(file_entries)} PDFs"
+              f" ({MAX_CONCURRENT_DOWNLOADS} at a time)...\n")
+
+        results = asyncio.run(download_all_pdfs(file_entries, output_dir))
+
+        # Summary
+        succeeded = [r for r in results if r[2]]
+        failed = [r for r in results if not r[2]]
+
+        print(f"\n{'=' * 60}")
+        print(f"🎉 Done! {len(succeeded)}/{len(results)} PDFs saved to {output_dir}/")
+
+        # Option C fallback: open failures in Brave
+        if failed:
+            print(f"\n⚠️  {len(failed)} PDF(s) failed to auto-download:")
+            for name, fid, _, error in failed:
+                print(f"  • {name}: {error}")
+
+            choice = input(
+                f"\n🌐 Open {len(failed)} failed PDF(s) in Brave for manual download? (y/n): "
+            ).strip().lower()
+            if choice in ('y', 'yes', ''):
+                open_failures_in_brave(failed)
+    else:
+        # No headless deps — fall back to opening all in Brave
+        input("\n⏎ Press Enter to open all in Brave...")
+        urls = [f"https://drive.google.com/file/d/{fid}/view" for fid, _ in file_entries]
+
+        brave = find_brave()
+        if brave:
+            print(f"\n🌐 Opening {len(urls)} tabs in Brave...")
+            subprocess.Popen([brave] + urls)
+            print("✅ Tabs opened! Use your extension to download each PDF.")
+        else:
+            print("❌ Brave not found! Opening in default browser...")
+            import webbrowser
+            for u in urls:
+                webbrowser.open(u)
+
+
+if __name__ == "__main__":
+    main()
