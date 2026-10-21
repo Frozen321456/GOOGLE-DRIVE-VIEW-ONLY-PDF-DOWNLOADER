@@ -113,8 +113,27 @@ python app.py          # http://localhost:5000/api/health
 
 | Endpoint | Method | Body | Returns |
 |---|---|---|---|
-| `/api/download` | POST | `{ "url": "<drive url>" }` or `{ "fileId": "<id>" }` | `application/pdf` blob |
+| `/api/download` | POST | `{ "url": "<drive url>" }` or `{ "fileId": "<id>" }` | `application/pdf` blob (sync — small docs) |
+| `/api/jobs` | POST | same body | `202 { "jobId", "status" }` — async render, use for any size |
+| `/api/jobs/:id` | GET | — | `{ "status": "queued\|processing\|completed\|failed", "fileName?", "size?", "error?" }` |
+| `/api/jobs/:id/result` | GET | — | `application/pdf` when ready (409 while rendering) |
 | `/api/health` | GET | — | `{ "status": "ok", "timestamp": ... }` |
+
+### Large documents
+
+Rendering runs in a background thread after `POST /api/jobs` returns, so no
+proxy timeout applies — a 500-page scan just takes longer, with the UI
+showing live progress while polling. Identical in-flight requests are
+deduplicated (second POST returns the same jobId), and finished results stay
+fetchable for 15 minutes.
+
+### How capture works
+
+Drive's viewer renders one page at a time, so `page.pdf()` prints a single
+page. Instead, the engine opens `/view`, scrolls the whole document to
+lazy-load every page image, intercepts those images from the network layer,
+groups them by `page=` parameter, and reassembles them with img2pdf — one
+clean PDF, full document, correct order.
 
 Error JSON: `{ "error": "message", "code": "INVALID_URL" |
 "NOT_ACCESSIBLE" | "RENDER_FAILED" }`.
