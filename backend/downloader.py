@@ -1,17 +1,24 @@
-"""Playwright-based Drive preview → PDF builder.
+"""Drive preview → PDF builder (full-document capture).
 
 Strategy (in order, first that works wins):
   1. drive.google.com/uc?export=download&id={id}   — direct download endpoint
-  2. drive.google.com/uc?export=view&id={id}       — inline view endpoint
-  3. Preview page → headless-Chromium print-to-PDF (falls back to printing
-     whatever the preview page renders, including the embedded viewer)
+  2. Headless Chromium on the Drive viewer (/view): intercept the rendered
+     page images Drive serves, scroll through the whole document to trigger
+     lazy-loading, group by `page=` URL param, combine with img2pdf.
+
+  Why not page.pdf(): the Drive viewer is a JS app that renders ONE page at
+  a time — printing it captures a single page (or a blank/loading shell).
+  Intercepting the page images + img2pdf produces the full document.
 
 Returns (pdf_bytes, suggested_filename). Raises DownloadError with a
 machine-readable code + HTTP status for the API layer.
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import re
+import urllib.parse
 
 import requests
 
@@ -19,9 +26,11 @@ USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
-REQUEST_TIMEOUT = 25  # seconds for direct HTTP attempts
-NAV_TIMEOUT = 30_000  # ms for Playwright navigation
+REQUEST_TIMEOUT = 25    # seconds for direct HTTP attempts
+NAV_TIMEOUT = 60_000    # ms for Playwright navigation
 MAX_PDF_BYTES = 100 * 1024 * 1024  # 100 MB hard stop (free-tier RAM guard)
+SCROLL_STEPS_MAX = 55   # 55 x 0.9s ≈ 50s worst case (keeps total < gunicorn 120s)
+STABLE_ROUNDS_END = 4   # consecutive no-scroll rounds = bottom reached
 
 
 class DownloadError(Exception):
@@ -109,14 +118,245 @@ def _try_direct_download(session: requests.Session, file_id: str):
     return None
 
 
-def _safe_filename_from_title(title: str, fallback: str) -> str:
-    title = (title or "").strip()
-    if not title:
+def _clean_title_to_filename(title: str, fallback: str) -> str:
+    """'Unit 01.pdf - Google Drive' -> 'Unit 01.pdf'"""
+    t = (title or "").strip()
+    if " - Google Drive" in t:
+        t = t.split(" - Google Drive")[0]
+    t = re.sub(r'[\\/:*?"<>|]', "_", t).strip()
+    if not t:
         return fallback
-    title = re.sub(r'[\\/:*?"<>|]', "_", title)
-    if not title.lower().endswith(".pdf"):
-        title += ".pdf"
-    return title[:120]
+    if not t.lower().endswith(".pdf"):
+        t += ".pdf"
+    return t[:120]
+
+
+# JS injected into the viewer page: report scrollTop of Drive's scroll container.
+_SCROLL_POS_JS = """
+() => {
+    const findScrollContainer = () => {
+        const doc = document.querySelector('[role="document"]');
+        if (doc) {
+            let parent = doc;
+            while (parent) {
+                if (parent.scrollHeight > parent.clientHeight + 10) {
+                    const style = window.getComputedStyle(parent);
+                    if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                        return parent;
+                    }
+                }
+                parent = parent.parentElement;
+            }
+        }
+        const divs = Array.from(document.querySelectorAll('div'));
+        let best = null;
+        let maxScroll = 0;
+        for (const div of divs) {
+            if (div.scrollHeight > div.clientHeight + 50) {
+                const style = window.getComputedStyle(div);
+                if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                    if (div.scrollHeight > maxScroll) {
+                        maxScroll = div.scrollHeight;
+                        best = div;
+                    }
+                }
+            }
+        }
+        return best || document.documentElement;
+    };
+    const c = findScrollContainer();
+    return c ? c.scrollTop : 0;
+}
+"""
+
+# JS: scroll the container down by ~80% of its viewport.
+_SCROLL_STEP_JS = """
+() => {
+    const findScrollContainer = () => {
+        const doc = document.querySelector('[role="document"]');
+        if (doc) {
+            let parent = doc;
+            while (parent) {
+                if (parent.scrollHeight > parent.clientHeight + 10) {
+                    const style = window.getComputedStyle(parent);
+                    if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                        return parent;
+                    }
+                }
+                parent = parent.parentElement;
+            }
+        }
+        const divs = Array.from(document.querySelectorAll('div'));
+        let best = null;
+        let maxScroll = 0;
+        for (const div of divs) {
+            if (div.scrollHeight > div.clientHeight + 50) {
+                const style = window.getComputedStyle(div);
+                if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                    if (div.scrollHeight > maxScroll) {
+                        maxScroll = div.scrollHeight;
+                        best = div;
+                    }
+                }
+            }
+        }
+        return best || document.documentElement;
+    };
+    const c = findScrollContainer();
+    if (c) c.scrollTop += c.clientHeight * 0.8;
+}
+"""
+
+
+def _assemble_pdf_from_images(captured_by_url: dict) -> tuple[bytes, int]:
+    """Group page images by URL `page=` param (largest wins), dedupe, img2pdf."""
+    try:
+        from PIL import Image
+        import img2pdf
+    except ImportError as exc:
+        raise DownloadError(
+            "Image pipeline not installed on the server", "RENDER_FAILED", 500
+        ) from exc
+
+    pages_by_num: dict[int, bytes] = {}
+    unpageable: list[bytes] = []
+
+    for url, img_bytes in captured_by_url.items():
+        try:
+            img = Image.open(io.BytesIO(img_bytes))
+            if img.width < 200 or img.height < 200:
+                continue  # icons / UI chrome
+        except Exception:
+            continue
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        if "page" in qs:
+            try:
+                n = int(qs["page"][0])
+                if n not in pages_by_num or len(img_bytes) > len(pages_by_num[n]):
+                    pages_by_num[n] = img_bytes
+            except ValueError:
+                unpageable.append(img_bytes)
+        else:
+            unpageable.append(img_bytes)
+
+    ordered: list[bytes] = []
+    if pages_by_num:
+        ordered = [pages_by_num[n] for n in sorted(pages_by_num)]
+    else:
+        seen: set[str] = set()
+        for b in unpageable:
+            h = hashlib.md5(b).hexdigest()
+            if h not in seen:
+                seen.add(h)
+                ordered.append(b)
+
+    if not ordered:
+        raise DownloadError("No page images could be captured", "RENDER_FAILED", 500)
+
+    processed = []
+    for b in ordered:
+        try:
+            img = Image.open(io.BytesIO(b))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=92)
+            processed.append(buf.getvalue())
+        except Exception:
+            continue
+
+    if not processed:
+        raise DownloadError("Captured images could not be processed", "RENDER_FAILED", 500)
+
+    pdf_bytes = img2pdf.convert(processed)
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        raise DownloadError("PDF exceeds the 100 MB limit", "RENDER_FAILED", 500)
+    return pdf_bytes, len(processed)
+
+
+def _capture_view_document(context, file_id: str) -> tuple[bytes, str]:
+    """Open the Drive viewer, scroll through, capture page images, build PDF."""
+    page = context.new_page()
+    captured_by_url: dict[str, bytes] = {}
+
+    def on_response(response):
+        try:
+            ct = (response.headers or {}).get("content-type", "")
+            if response.status == 200 and any(
+                t in ct for t in ("image/jpeg", "image/png", "image/webp")
+            ):
+                body = response.body()
+                if len(body) > 10_000:  # page renders are big; icons are tiny
+                    captured_by_url[response.url] = body
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+    page_title = ""
+    try:
+        page.goto(
+            f"https://drive.google.com/file/d/{file_id}/view",
+            wait_until="domcontentloaded",
+            timeout=NAV_TIMEOUT,
+        )
+        page.wait_for_timeout(5000)  # viewer init + first pages render
+
+        # Login redirect / error page detection
+        if "accounts.google.com" in (page.url or ""):
+            raise DownloadError(
+                "File is not accessible (permission denied)", "NOT_ACCESSIBLE", 403
+            )
+        page_title = page.title() or ""
+        content = page.content().lower()
+        title_l = page_title.lower()
+        error_markers = (
+            "you need access",
+            "request access",
+            "you don't have access",
+            "sorry, this file is private",
+            "this file is private",
+            "page not found",
+            "error occurred",
+        )
+        if any(m in title_l for m in ("denied", "not found", "error occurred")) or any(
+            m in content for m in error_markers
+        ):
+            raise DownloadError(
+                "File is not accessible (not found or permission denied)",
+                "NOT_ACCESSIBLE",
+                403,
+            )
+
+        # Scroll through the document to lazy-load every page image
+        stable = 0
+        for _ in range(SCROLL_STEPS_MAX):
+            before = page.evaluate(_SCROLL_POS_JS)
+            page.evaluate(_SCROLL_STEP_JS)
+            page.wait_for_timeout(900)
+            after = page.evaluate(_SCROLL_POS_JS)
+            if after == before:
+                stable += 1
+                if stable >= STABLE_ROUNDS_END:
+                    break
+            else:
+                stable = 0
+
+        page.wait_for_timeout(3000)  # in-flight images
+    finally:
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
+        page.close()
+
+    if not captured_by_url:
+        raise DownloadError(
+            "No page images captured from the Drive viewer", "RENDER_FAILED", 500
+        )
+
+    pdf_bytes, _page_count = _assemble_pdf_from_images(captured_by_url)
+    file_name = _clean_title_to_filename(page_title, f"{file_id}.pdf")
+    return pdf_bytes, file_name
 
 
 def build_pdf(file_id: str) -> tuple[bytes, str]:
@@ -128,13 +368,12 @@ def build_pdf(file_id: str) -> tuple[bytes, str]:
     session.headers.update({"User-Agent": USER_AGENT})
 
     try:
-        # Tier 1: direct endpoints
+        # Tier 1: direct endpoints (works when the file is truly public)
         direct = _try_direct_download(session, file_id)
         if direct:
             return direct
 
-        # Tier 2: headless Chromium — preview page print-to-PDF
-        preview_url = f"https://drive.google.com/file/d/{file_id}/preview"
+        # Tier 2: headless Chromium full-document capture
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
@@ -152,67 +391,17 @@ def build_pdf(file_id: str) -> tuple[bytes, str]:
                 ],
             )
             try:
-                context = browser.new_context(accept_downloads=False)
-                page = context.new_page()
-                page.goto(preview_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-
-                # Permission-wall / error-page detection (fake or private IDs
-                # land on Google's "sorry" page instead of a real viewer)
-                content = page.content().lower()
-                error_markers = (
-                    "you need access",
-                    "request access",
-                    "you don't have access",
-                    "sorry, this file is private",
-                    "this file is private",
-                    "can't be scanned for viruses",
-                    "drive.google.com/drive/error",
+                context = browser.new_context(
+                    viewport={"width": 1600, "height": 1000},
+                    user_agent=USER_AGENT,
+                    accept_downloads=False,
                 )
-                if any(marker in content for marker in error_markers):
-                    raise DownloadError(
-                        "File is not accessible (permission denied or not found)",
-                        "NOT_ACCESSIBLE",
-                        403,
-                    )
-
-                # Title check: Google error pages carry these titles even when
-                # the DOM text differs ("Page Not Found" on bad file IDs)
-                page_title = (page.title() or "").lower()
-                if any(t in page_title for t in ("page not found", "not found", "error occurred", "can't reach")):
-                    raise DownloadError(
-                        "File is not accessible (not found or permission denied)",
-                        "NOT_ACCESSIBLE",
-                        403,
-                    )
-
-                # Locate the in-page viewer embed/iframe when present
-                viewer_src = None
-                for sel in ("embed#docsrc", "iframe#docsrc", "#docsrc"):
-                    el = page.query_selector(sel)
-                    if el:
-                        viewer_src = el.get_attribute("src")
-                        if viewer_src:
-                            break
-
-                if viewer_src:
-                    page.goto(viewer_src, wait_until="load", timeout=NAV_TIMEOUT)
-                    page.wait_for_timeout(2500)  # viewer render settle
-                else:
-                    page.wait_for_timeout(3500)  # preview render settle
-
-                pdf_bytes = page.pdf(format="A4", print_background=True)
-                if not pdf_bytes or len(pdf_bytes) < 200:
-                    raise DownloadError("Rendered PDF was empty", "RENDER_FAILED", 500)
-
-                title = page.title() or ""
-                file_name = _safe_filename_from_title(title, f"{file_id}.pdf")
-                return pdf_bytes, file_name
+                return _capture_view_document(context, file_id)
             finally:
                 browser.close()
     except DownloadError:
         raise
     except Exception as exc:
-        # Playwright errors (and timeouts) arrive here once imported lazily
         raise DownloadError(f"Playwright render failed: {exc}", "RENDER_FAILED", 500) from exc
     finally:
         session.close()

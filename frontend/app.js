@@ -246,7 +246,7 @@ async function handleDownload() {
     await watchStatus(fileId, (status) => {
       const map = {
         queued: 'Queued on server…',
-        processing: 'Rendering PDF on server…',
+        processing: 'Capturing all pages on server…',
         completed: 'Server finished rendering…',
         failed: 'Server reported failure.',
       };
@@ -254,7 +254,7 @@ async function handleDownload() {
     });
 
     setStatus('Fetching from server…', { progress: 30 });
-    const { blob, fileName } = await fetchFromBackend(fileId, { signal: AbortSignal.timeout(120000) });
+    const { blob, fileName } = await fetchFromBackend(fileId, { signal: AbortSignal.timeout(180000) });
 
     // saving
     setStatus('Saving to browser storage…', { progress: 95 });

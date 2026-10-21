@@ -22,4 +22,5 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 
 # --workers 1: free-tier 512MB RAM can't fit two Chromium instances
-CMD gunicorn --bind 0.0.0.0:$PORT --timeout 120 --workers 1 --threads 4 app:app
+# --timeout 180: multi-page scroll-capture can take ~90s+
+CMD gunicorn --bind 0.0.0.0:$PORT --timeout 180 --workers 1 --threads 4 app:app
