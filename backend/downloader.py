@@ -175,6 +175,16 @@ def build_pdf(file_id: str) -> tuple[bytes, str]:
                         403,
                     )
 
+                # Title check: Google error pages carry these titles even when
+                # the DOM text differs ("Page Not Found" on bad file IDs)
+                page_title = (page.title() or "").lower()
+                if any(t in page_title for t in ("page not found", "not found", "error occurred", "can't reach")):
+                    raise DownloadError(
+                        "File is not accessible (not found or permission denied)",
+                        "NOT_ACCESSIBLE",
+                        403,
+                    )
+
                 # Locate the in-page viewer embed/iframe when present
                 viewer_src = None
                 for sel in ("embed#docsrc", "iframe#docsrc", "#docsrc"):
