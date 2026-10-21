@@ -203,7 +203,7 @@ _SCROLL_STEP_JS = """
         return best || document.documentElement;
     };
     const c = findScrollContainer();
-    if (c) c.scrollTop += c.clientHeight * 0.8;
+    if (c) c.scrollTop += c.clientHeight * 0.5;
 }
 """
 
@@ -327,7 +327,10 @@ def _capture_view_document(context, file_id: str) -> tuple[bytes, str]:
                 403,
             )
 
-        # Scroll through the document to lazy-load every page image
+        # Scroll through the document to lazy-load every page image.
+        # Steps are ~0.5 viewport so no page is skipped; after reaching the
+        # bottom we compare the captured page numbers against the viewer's
+        # own page count and re-scroll to any missing pages.
         stable = 0
         for _ in range(SCROLL_STEPS_MAX):
             before = page.evaluate(_SCROLL_POS_JS)
@@ -340,6 +343,70 @@ def _capture_view_document(context, file_id: str) -> tuple[bytes, str]:
                     break
             else:
                 stable = 0
+
+        def _captured_page_nums():
+            import urllib.parse as _up
+            nums = set()
+            for u in captured_by_url:
+                try:
+                    qs = _up.parse_qs(_up.urlparse(u).query)
+                    if "page" in qs:
+                        nums.add(int(qs["page"][0]))
+                except Exception:
+                    pass
+            return nums
+
+        total_pages = None
+        try:
+            total_pages = page.evaluate(
+                """() => {
+                    const el = document.querySelector(
+                        '.drive-viewer-paginated-page-number, [class*="pageCount"], [class*="page-number"]'
+                    );
+                    const t = el ? (el.textContent || '') : '';
+                    const m = t.match(/(\d+)\s*\/\s*(\d+)/);
+                    return m ? parseInt(m[2], 10) : null;
+                }"""
+            )
+        except Exception:
+            total_pages = None
+
+        # Retry pass: scroll back through the doc for any page numbers
+        # we never captured (each pass scrolls faster and waits longer).
+        for attempt in range(2):
+            if not total_pages:
+                break
+            have = _captured_page_nums()
+            missing = {n for n in range(1, total_pages + 1) if n not in have}
+            if not missing:
+                break
+            # walk from top to bottom again, slower, letting pages render
+            page.evaluate("""() => {
+                const c = document.querySelector('[role="document"]');
+                let p = c;
+                while (p) {
+                    if (p.scrollHeight > p.clientHeight + 10) {
+                        const s = window.getComputedStyle(p);
+                        if (s.overflowY === 'auto' || s.overflowY === 'scroll') break;
+                    }
+                    p = p.parentElement;
+                }
+                if (p) p.scrollTop = 0; else document.documentElement.scrollTop = 0;
+            }""")
+            page.wait_for_timeout(1500)
+            stable2 = 0
+            for _ in range(SCROLL_STEPS_MAX):
+                before = page.evaluate(_SCROLL_POS_JS)
+                page.evaluate(_SCROLL_STEP_JS)
+                page.wait_for_timeout(1400)
+                after = page.evaluate(_SCROLL_POS_JS)
+                if after == before:
+                    stable2 += 1
+                    if stable2 >= 3:
+                        break
+                else:
+                    stable2 = 0
+            page.wait_for_timeout(2500)
 
         page.wait_for_timeout(3000)  # in-flight images
     finally:
