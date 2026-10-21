@@ -31,12 +31,17 @@ def init_firebase() -> bool:
             import firebase_admin
             from firebase_admin import credentials
 
-            b64 = os.environ.get("FIREBASE_CREDENTIALS_JSON", "").strip()
-            if not b64:
+            raw = os.environ.get("FIREBASE_CREDENTIALS_JSON", "").strip()
+            if not raw:
                 log.warning("FIREBASE_CREDENTIALS_JSON not set — RTDB status sync disabled")
                 return False
 
-            service_account = json.loads(base64.b64decode(b64).decode("utf-8"))
+            # Accept BOTH formats: raw service-account JSON (what the Firebase
+            # console gives you) or its base64 encoding (env-var friendly).
+            if raw.startswith("{"):
+                service_account = json.loads(raw)
+            else:
+                service_account = json.loads(base64.b64decode(raw).decode("utf-8"))
             cred = credentials.Certificate(service_account)
             _app = firebase_admin.initialize_app(cred, {
                 "databaseURL": os.environ.get(
