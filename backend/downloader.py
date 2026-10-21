@@ -29,8 +29,11 @@ USER_AGENT = (
 REQUEST_TIMEOUT = 25    # seconds for direct HTTP attempts
 NAV_TIMEOUT = 60_000    # ms for Playwright navigation
 MAX_PDF_BYTES = 100 * 1024 * 1024  # 100 MB hard stop (free-tier RAM guard)
-SCROLL_STEPS_MAX = 55   # 55 x 0.9s ≈ 50s worst case (keeps total < gunicorn 120s)
-STABLE_ROUNDS_END = 4   # consecutive no-scroll rounds = bottom reached
+# Steps needed ≈ pages * pageHeight / (0.5 * viewportHeight). A 61-page doc at
+# 1000px viewport, ~1050px pages needs ~130 steps; cap generously at 300.
+# Job API renders in a background thread, so long walks are fine.
+SCROLL_STEPS_MAX = 300
+STABLE_ROUNDS_END = 5   # consecutive no-scroll rounds = bottom reached
 
 
 class DownloadError(Exception):
@@ -360,12 +363,30 @@ def _capture_view_document(context, file_id: str) -> tuple[bytes, str]:
         try:
             total_pages = page.evaluate(
                 """() => {
-                    const el = document.querySelector(
-                        '.drive-viewer-paginated-page-number, [class*="pageCount"], [class*="page-number"]'
-                    );
-                    const t = el ? (el.textContent || '') : '';
-                    const m = t.match(/(\d+)\s*\/\s*(\d+)/);
-                    return m ? parseInt(m[2], 10) : null;
+                    // Drive viewer page indicator: try known selectors, then
+                    // any element whose whole text looks like "12 / 61".
+                    const sels = [
+                        '.drive-viewer-paginated-page-number',
+                        '[class*="pageCount"]',
+                        '[class*="page-number"]',
+                        '[aria-label*="Page"]',
+                    ];
+                    for (const sel of sels) {
+                        for (const el of document.querySelectorAll(sel)) {
+                            const hay = (el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '');
+                            const m = hay.match(/(\d+)\s*\/\s*(\d+)/);
+                            if (m) return parseInt(m[2], 10);
+                        }
+                    }
+                    const walker = document.evaluate(
+                        "//*[contains(normalize-space(text()), '/')]",
+                        document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                    for (let i = 0; i < Math.min(walker.snapshotLength, 400); i++) {
+                        const t = (walker.snapshotItem(i).textContent || '').trim();
+                        const m = t.match(/^(\d{1,4})\s*\/\s*(\d{1,4})$/);
+                        if (m) return parseInt(m[2], 10);
+                    }
+                    return null;
                 }"""
             )
         except Exception:
