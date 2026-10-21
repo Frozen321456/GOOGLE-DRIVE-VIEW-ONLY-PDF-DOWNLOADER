@@ -1,14 +1,24 @@
 """GDrive PDF Fetcher — Flask backend (Render free tier, Docker).
 
 Endpoints:
-  GET  /api/health    -> keep-alive / warm-up probe
-  POST /api/download  -> { url } | { fileId } -> application/pdf blob
+  GET  /api/health       -> keep-alive / warm-up probe
+  POST /api/download     -> { url } | { fileId } -> application/pdf blob
+                            (sync path; fine for small docs)
+  POST /api/jobs         -> { url } | { fileId } -> 202 { jobId }
+                            async path for large docs; render runs in a
+                            background thread, status goes to RTDB
+  GET  /api/jobs/<id>    -> { status, fileName?, size?, error? }
+  GET  /api/jobs/<id>/result -> application/pdf when ready (409 before)
 
-Never writes PDFs to disk (Render free has no persistent disk).
-Status writes go to Firebase RTDB (metadata only).
+Status model (RTDB /pdfs/{fileId} + in-memory jobs):
+  queued -> processing -> completed | failed
+Job results are held in memory only (Render free has no disk); a finished
+job stays retrievable for RESULT_TTL seconds, then the payload is dropped.
 """
 import os
+import threading
 import time
+import uuid
 
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
@@ -28,7 +38,7 @@ CORS(
     supports_private_network=True,
 )
 
-# Optional rate limiting: 10 req/min per IP on /api/download.
+# Optional rate limiting: 10 req/min per IP on /api/download + /api/jobs.
 # Falls back silently when flask-limiter is not installed.
 try:
     from flask_limiter import Limiter
@@ -50,6 +60,14 @@ except ImportError:  # pragma: no cover - slim dep path
         return fn
 
 
+# ---------------- async job registry (in-memory) ----------------
+JOBS: dict[str, dict] = {}
+JOBS_LOCK = threading.Lock()
+RESULT_TTL = 15 * 60  # keep finished job payloads for 15 minutes
+MAX_CONCURRENT_RENDERS = 1  # free tier: one Chromium at a time
+_RENDER_SEM = threading.Semaphore(MAX_CONCURRENT_RENDERS)
+
+
 def _extract_file_id(payload: dict) -> str | None:
     """Accept {url} (any Drive URL form) or {fileId} (raw ID)."""
     from downloader import extract_file_id
@@ -58,6 +76,56 @@ def _extract_file_id(payload: dict) -> str | None:
         return None
     raw = payload.get("url") or payload.get("fileId") or ""
     return extract_file_id(str(raw))
+
+
+def _run_job(job_id: str, file_id: str) -> None:
+    """Background worker: build the PDF, store result, update RTDB."""
+    with _RENDER_SEM:
+        job = JOBS.get(job_id)
+        if job is None:
+            return
+        job["status"] = "processing"
+        job["startedAt"] = time.time()
+        set_status(file_id, "processing", jobId=job_id)
+
+        try:
+            pdf_bytes, file_name = build_pdf(file_id)
+        except DownloadError as exc:
+            job.update(status="failed", error=str(exc), code=exc.code,
+                       finishedAt=time.time())
+            set_status(file_id, "failed", error=str(exc), jobId=job_id)
+            return
+        except Exception as exc:  # unexpected
+            job.update(status="failed", error=f"Unexpected error: {exc}",
+                       code="RENDER_FAILED", finishedAt=time.time())
+            set_status(file_id, "failed", error=f"Unexpected error: {exc}",
+                       jobId=job_id)
+            return
+
+        job.update(
+            status="completed",
+            fileName=file_name,
+            size=len(pdf_bytes),
+            result=pdf_bytes,
+            finishedAt=time.time(),
+        )
+        set_status(
+            file_id,
+            "completed",
+            fileName=file_name,
+            size=len(pdf_bytes),
+            jobId=job_id,
+            completedAt=int(time.time() * 1000),
+        )
+
+        # TTL cleanup: drop payload after RESULT_TTL
+        def _gc():
+            time.sleep(RESULT_TTL)
+            with JOBS_LOCK:
+                j = JOBS.get(job_id)
+                if j and j.get("status") in ("completed", "failed"):
+                    j.pop("result", None)
+        threading.Thread(target=_gc, daemon=True).start()
 
 
 @app.get("/api/health")
@@ -105,6 +173,84 @@ def download():
         mimetype="application/pdf",
         headers={
             "Content-Disposition": f'attachment; filename="{file_name}"',
+            "Content-Length": str(len(pdf_bytes)),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/api/jobs")
+@rate_limited
+def create_job():
+    payload = request.get_json(silent=True) or {}
+    file_id = _extract_file_id(payload)
+
+    if not file_id:
+        return (
+            jsonify({"error": "Could not parse a Drive file ID from the input", "code": "INVALID_URL"}),
+            400,
+        )
+
+    # Reuse an identical in-flight/completed job instead of re-rendering
+    with JOBS_LOCK:
+        now = time.time()
+        for jid, j in JOBS.items():
+            if j.get("fileId") != file_id:
+                continue
+            if j.get("status") in ("queued", "processing"):
+                return jsonify({"jobId": jid, "status": j["status"], "reused": True}), 202
+            if j.get("status") == "completed" and now - j.get("finishedAt", 0) <= RESULT_TTL:
+                return jsonify({"jobId": jid, "status": "completed", "reused": True}), 202
+
+        job_id = uuid.uuid4().hex[:16]
+        JOBS[job_id] = {
+            "jobId": job_id,
+            "fileId": file_id,
+            "status": "queued",
+            "createdAt": now,
+        }
+
+    set_status(file_id, "queued", requestedAt=int(time.time() * 1000), jobId=job_id)
+    threading.Thread(target=_run_job, args=(job_id, file_id), daemon=True).start()
+
+    return jsonify({"jobId": job_id, "status": "queued"}), 202
+
+
+@app.get("/api/jobs/<job_id>")
+def job_status(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        return jsonify({"error": "Unknown job", "code": "NOT_FOUND"}), 404
+
+    body = {
+        "jobId": job_id,
+        "fileId": job.get("fileId"),
+        "status": job.get("status"),
+    }
+    if job.get("status") == "completed":
+        body.update(fileName=job.get("fileName"), size=job.get("size"))
+    elif job.get("status") == "failed":
+        body.update(error=job.get("error"), code=job.get("code"))
+    return jsonify(body), 200
+
+
+@app.get("/api/jobs/<job_id>/result")
+def job_result(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        return jsonify({"error": "Unknown job", "code": "NOT_FOUND"}), 404
+    if job.get("status") == "failed":
+        return jsonify({"error": job.get("error", "render failed"),
+                        "code": job.get("code", "RENDER_FAILED")}), 500
+    if job.get("status") != "completed" or not job.get("result"):
+        return jsonify({"error": "Result not ready", "code": "NOT_READY"}), 409
+
+    pdf_bytes = job["result"]
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{job.get("fileName", job_id + ".pdf")}"',
             "Content-Length": str(len(pdf_bytes)),
             "Cache-Control": "no-store",
         },
