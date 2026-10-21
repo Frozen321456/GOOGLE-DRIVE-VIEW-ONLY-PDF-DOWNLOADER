@@ -65,6 +65,9 @@ def set_status(file_id: str, status: str, **extra) -> None:
 
         ref = db.reference(f"/pdfs/{file_id}")
         payload = {"status": status}
+        if status in ("queued", "processing"):
+            # reset fields from any previous attempt
+            payload.update({"error": None, "fileName": None, "completedAt": None})
         payload.update(extra)
         ref.update(payload)
     except Exception as exc:  # pragma: no cover - network best-effort

@@ -156,15 +156,21 @@ def build_pdf(file_id: str) -> tuple[bytes, str]:
                 page = context.new_page()
                 page.goto(preview_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
 
-                # Permission-wall detection
+                # Permission-wall / error-page detection (fake or private IDs
+                # land on Google's "sorry" page instead of a real viewer)
                 content = page.content().lower()
-                if (
-                    "you need access" in content
-                    or "request access" in content
-                    or "you don't have access" in content
-                ):
+                error_markers = (
+                    "you need access",
+                    "request access",
+                    "you don't have access",
+                    "sorry, this file is private",
+                    "this file is private",
+                    "can't be scanned for viruses",
+                    "drive.google.com/drive/error",
+                )
+                if any(marker in content for marker in error_markers):
                     raise DownloadError(
-                        "File is not accessible (permission denied)",
+                        "File is not accessible (permission denied or not found)",
                         "NOT_ACCESSIBLE",
                         403,
                     )
