@@ -48,6 +48,10 @@ gdrive-pdf-fetcher/
 
 ## Setup
 
+> **Deploying now?** Follow [docs/DEPLOY.md](docs/DEPLOY.md) — a click-by-click
+> walkthrough (Firebase → Render → Vercel, with every field, env var and
+> troubleshooting row).
+
 ### 1. Firebase (RTDB status sync — optional but recommended)
 
 1. console.firebase.google.com → create project.
