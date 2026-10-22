@@ -79,7 +79,12 @@ def _extract_file_id(payload: dict) -> str | None:
 
 
 def _run_job(job_id: str, file_id: str) -> None:
-    """Background worker: build the PDF, store result, update RTDB."""
+    """Background worker: build the PDF, store result, update RTDB.
+
+    build_pdf's progress callback streams real capture state
+    (scrollPct / pagesDone / pagesTotal) into the job record, so the
+    frontend can show actual progress instead of a fake creeping bar.
+    """
     with _RENDER_SEM:
         job = JOBS.get(job_id)
         if job is None:
@@ -88,8 +93,26 @@ def _run_job(job_id: str, file_id: str) -> None:
         job["startedAt"] = time.time()
         set_status(file_id, "processing", jobId=job_id)
 
+        def on_progress(info: dict):
+            job.update(
+                phase=info.get("phase"),
+                scrollPct=info.get("scrollPct"),
+                pagesDone=info.get("pagesDone"),
+                pagesTotal=info.get("pagesTotal"),
+                progressAt=time.time(),
+            )
+            # best-effort RTDB mirror for cross-tab visibility
+            set_status(
+                file_id,
+                "processing",
+                jobId=job_id,
+                phase=info.get("phase"),
+                pagesDone=info.get("pagesDone"),
+                pagesTotal=info.get("pagesTotal"),
+            )
+
         try:
-            pdf_bytes, file_name = build_pdf(file_id)
+            pdf_bytes, file_name = build_pdf(file_id, progress=on_progress)
         except DownloadError as exc:
             job.update(status="failed", error=str(exc), code=exc.code,
                        finishedAt=time.time())
@@ -227,7 +250,14 @@ def job_status(job_id: str):
         "fileId": job.get("fileId"),
         "status": job.get("status"),
     }
-    if job.get("status") == "completed":
+    if job.get("status") == "processing":
+        body.update(
+            phase=job.get("phase"),
+            scrollPct=job.get("scrollPct"),
+            pagesDone=job.get("pagesDone"),
+            pagesTotal=job.get("pagesTotal"),
+        )
+    elif job.get("status") == "completed":
         body.update(fileName=job.get("fileName"), size=job.get("size"))
     elif job.get("status") == "failed":
         body.update(error=job.get("error"), code=job.get("code"))

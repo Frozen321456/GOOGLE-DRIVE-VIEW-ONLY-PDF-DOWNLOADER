@@ -210,8 +210,113 @@ _SCROLL_STEP_JS = """
 }
 """
 
+# JS: one-call scroll metrics + viewer total page count (for progress).
+_SCROLL_INFO_JS = """
+() => {
+    const findScrollContainer = () => {
+        const doc = document.querySelector('[role="document"]');
+        if (doc) {
+            let parent = doc;
+            while (parent) {
+                if (parent.scrollHeight > parent.clientHeight + 10) {
+                    const style = window.getComputedStyle(parent);
+                    if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                        return parent;
+                    }
+                }
+                parent = parent.parentElement;
+            }
+        }
+        const divs = Array.from(document.querySelectorAll('div'));
+        let best = null;
+        let maxScroll = 0;
+        for (const div of divs) {
+            if (div.scrollHeight > div.clientHeight + 50) {
+                const style = window.getComputedStyle(div);
+                if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                    if (div.scrollHeight > maxScroll) {
+                        maxScroll = div.scrollHeight;
+                        best = div;
+                    }
+                }
+            }
+        }
+        return best || document.documentElement;
+    };
+    const c = findScrollContainer();
+    const scrollTop = c ? c.scrollTop : 0;
+    const scrollHeight = c ? c.scrollHeight : 0;
+    const clientHeight = c ? c.clientHeight : 0;
 
-def _assemble_pdf_from_images(captured_by_url: dict) -> tuple[bytes, int]:
+    let totalPages = null;
+    const sels = [
+        '.drive-viewer-paginated-page-number',
+        '[class*="pageCount"]',
+        '[class*="page-number"]',
+        '[aria-label*="Page"]',
+    ];
+    for (const sel of sels) {
+        for (const el of document.querySelectorAll(sel)) {
+            const hay = (el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '');
+            const m = hay.match(/(\d+)\s*\/\s*(\d+)/);
+            if (m) { totalPages = parseInt(m[2], 10); break; }
+        }
+        if (totalPages) break;
+    }
+    if (!totalPages) {
+        const walker = document.evaluate(
+            "//*[contains(normalize-space(text()), '/')]",
+            document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+        for (let i = 0; i < Math.min(walker.snapshotLength, 400); i++) {
+            const t = (walker.snapshotItem(i).textContent || '').trim();
+            const m = t.match(/^(\d{1,4})\s*\/\s*(\d{1,4})$/);
+            if (m) { totalPages = parseInt(m[2], 10); break; }
+        }
+    }
+    return { scrollTop, scrollHeight, clientHeight, totalPages };
+}
+"""
+
+# JS: jump to an absolute fraction of the document (targeted missing-page retries).
+_SCROLL_TO_JS = """
+(frac) => {
+    const findScrollContainer = () => {
+        const doc = document.querySelector('[role="document"]');
+        if (doc) {
+            let parent = doc;
+            while (parent) {
+                if (parent.scrollHeight > parent.clientHeight + 10) {
+                    const style = window.getComputedStyle(parent);
+                    if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                        return parent;
+                    }
+                }
+                parent = parent.parentElement;
+            }
+        }
+        const divs = Array.from(document.querySelectorAll('div'));
+        let best = null;
+        let maxScroll = 0;
+        for (const div of divs) {
+            if (div.scrollHeight > div.clientHeight + 50) {
+                const style = window.getComputedStyle(div);
+                if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                    if (div.scrollHeight > maxScroll) {
+                        maxScroll = div.scrollHeight;
+                        best = div;
+                    }
+                }
+            }
+        }
+        return best || document.documentElement;
+    };
+    const c = findScrollContainer();
+    if (c) c.scrollTop = c.scrollHeight * frac;
+}
+"""
+
+
+def _assemble_pdf_from_images(captured_by_url: dict, progress=None) -> tuple[bytes, int]:
     """Group page images by URL `page=` param (largest wins), dedupe, img2pdf."""
     try:
         from PIL import Image
@@ -260,11 +365,23 @@ def _assemble_pdf_from_images(captured_by_url: dict) -> tuple[bytes, int]:
     for b in ordered:
         try:
             img = Image.open(io.BytesIO(b))
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=92)
-            processed.append(buf.getvalue())
+            if img.width < 200 or img.height < 200:
+                continue
+            if img.format == "JPEG":
+                # Embed original bytes — zero quality loss, no double-compress.
+                processed.append(b)
+            else:
+                # PNG/WebP: flatten alpha onto white, encode once at q95.
+                if img.mode in ("RGBA", "LA", "P"):
+                    img = img.convert("RGBA")
+                    bg = Image.new("RGB", img.size, (255, 255, 255))
+                    bg.paste(img, mask=img.split()[-1])
+                    img = bg
+                elif img.mode != "RGB":
+                    img = img.convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=95)
+                processed.append(buf.getvalue())
         except Exception:
             continue
 
@@ -277,8 +394,12 @@ def _assemble_pdf_from_images(captured_by_url: dict) -> tuple[bytes, int]:
     return pdf_bytes, len(processed)
 
 
-def _capture_view_document(context, file_id: str) -> tuple[bytes, str]:
-    """Open the Drive viewer, scroll through, capture page images, build PDF."""
+def _capture_view_document(context, file_id: str, progress=None) -> tuple[bytes, str]:
+    """Open the Drive viewer, scroll through, capture page images, build PDF.
+
+    `progress`, when given, is called with dicts like
+    {phase, scrollPct, pagesDone, pagesTotal} as the walk advances.
+    """
     page = context.new_page()
     captured_by_url: dict[str, bytes] = {}
 
@@ -330,16 +451,80 @@ def _capture_view_document(context, file_id: str) -> tuple[bytes, str]:
                 403,
             )
 
+        def _captured_page_nums() -> set[int]:
+            nums = set()
+            for u in captured_by_url:
+                try:
+                    qs = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+                    if "page" in qs:
+                        nums.add(int(qs["page"][0]))
+                except Exception:
+                    pass
+            return nums
+
+        def _total_pages_from_viewer() -> int | None:
+            try:
+                return page.evaluate(
+                    """() => {
+                        const sels = [
+                            '.drive-viewer-paginated-page-number',
+                            '[class*="pageCount"]',
+                            '[class*="page-number"]',
+                            '[aria-label*="Page"]',
+                        ];
+                        for (const sel of sels) {
+                            for (const el of document.querySelectorAll(sel)) {
+                                const hay = (el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '');
+                                const m = hay.match(/(\d+)\s*\/\s*(\d+)/);
+                                if (m) return parseInt(m[2], 10);
+                            }
+                        }
+                        const walker = document.evaluate(
+                            "//*[contains(normalize-space(text()), '/')]",
+                            document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                        for (let i = 0; i < Math.min(walker.snapshotLength, 400); i++) {
+                            const t = (walker.snapshotItem(i).textContent || '').trim();
+                            const m = t.match(/^(\d{1,4})\s*\/\s*(\d{1,4})$/);
+                            if (m) return parseInt(m[2], 10);
+                        }
+                        return null;
+                    }"""
+                )
+            except Exception:
+                return None
+
+        def _emit(phase: str, **extra):
+            if not progress:
+                return
+            try:
+                info = page.evaluate(_SCROLL_INFO_JS)
+                sh = info.get("scrollHeight") or 0
+                st = info.get("scrollTop") or 0
+                payload = {
+                    "phase": phase,
+                    "scrollPct": round(min(st / sh, 1.0) * 100, 1) if sh else None,
+                    "pagesDone": len(_captured_page_nums()),
+                    "pagesTotal": info.get("totalPages"),
+                }
+                payload.update(extra)
+                progress(payload)
+            except Exception:
+                pass
+
         # Scroll through the document to lazy-load every page image.
         # Steps are ~0.5 viewport so no page is skipped; after reaching the
         # bottom we compare the captured page numbers against the viewer's
         # own page count and re-scroll to any missing pages.
         stable = 0
+        last_emit = 0.0
         for _ in range(SCROLL_STEPS_MAX):
             before = page.evaluate(_SCROLL_POS_JS)
             page.evaluate(_SCROLL_STEP_JS)
             page.wait_for_timeout(900)
             after = page.evaluate(_SCROLL_POS_JS)
+            if after - before >= 0 and (after - last_emit) > 0:  # emit per step
+                _emit("render")
+                last_emit = after
             if after == before:
                 stable += 1
                 if stable >= STABLE_ROUNDS_END:
@@ -347,89 +532,28 @@ def _capture_view_document(context, file_id: str) -> tuple[bytes, str]:
             else:
                 stable = 0
 
-        def _captured_page_nums():
-            import urllib.parse as _up
-            nums = set()
-            for u in captured_by_url:
-                try:
-                    qs = _up.parse_qs(_up.urlparse(u).query)
-                    if "page" in qs:
-                        nums.add(int(qs["page"][0]))
-                except Exception:
-                    pass
-            return nums
-
-        total_pages = None
-        try:
-            total_pages = page.evaluate(
-                """() => {
-                    // Drive viewer page indicator: try known selectors, then
-                    // any element whose whole text looks like "12 / 61".
-                    const sels = [
-                        '.drive-viewer-paginated-page-number',
-                        '[class*="pageCount"]',
-                        '[class*="page-number"]',
-                        '[aria-label*="Page"]',
-                    ];
-                    for (const sel of sels) {
-                        for (const el of document.querySelectorAll(sel)) {
-                            const hay = (el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '');
-                            const m = hay.match(/(\d+)\s*\/\s*(\d+)/);
-                            if (m) return parseInt(m[2], 10);
-                        }
-                    }
-                    const walker = document.evaluate(
-                        "//*[contains(normalize-space(text()), '/')]",
-                        document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                    for (let i = 0; i < Math.min(walker.snapshotLength, 400); i++) {
-                        const t = (walker.snapshotItem(i).textContent || '').trim();
-                        const m = t.match(/^(\d{1,4})\s*\/\s*(\d{1,4})$/);
-                        if (m) return parseInt(m[2], 10);
-                    }
-                    return null;
-                }"""
-            )
-        except Exception:
-            total_pages = None
-
-        # Retry pass: scroll back through the doc for any page numbers
-        # we never captured (each pass scrolls faster and waits longer).
-        for attempt in range(2):
+        # Retry passes: jump directly to the fractional positions of missing
+        # pages (fast) instead of re-walking the whole document.
+        total_pages = _total_pages_from_viewer()
+        for attempt in range(3):
             if not total_pages:
                 break
             have = _captured_page_nums()
-            missing = {n for n in range(1, total_pages + 1) if n not in have}
+            missing = sorted(n for n in range(1, total_pages + 1) if n not in have)
             if not missing:
                 break
-            # walk from top to bottom again, slower, letting pages render
-            page.evaluate("""() => {
-                const c = document.querySelector('[role="document"]');
-                let p = c;
-                while (p) {
-                    if (p.scrollHeight > p.clientHeight + 10) {
-                        const s = window.getComputedStyle(p);
-                        if (s.overflowY === 'auto' || s.overflowY === 'scroll') break;
-                    }
-                    p = p.parentElement;
-                }
-                if (p) p.scrollTop = 0; else document.documentElement.scrollTop = 0;
-            }""")
-            page.wait_for_timeout(1500)
-            stable2 = 0
-            for _ in range(SCROLL_STEPS_MAX):
-                before = page.evaluate(_SCROLL_POS_JS)
-                page.evaluate(_SCROLL_STEP_JS)
-                page.wait_for_timeout(1400)
-                after = page.evaluate(_SCROLL_POS_JS)
-                if after == before:
-                    stable2 += 1
-                    if stable2 >= 3:
-                        break
-                else:
-                    stable2 = 0
-            page.wait_for_timeout(2500)
+            _emit("retry", missing=len(missing))
+            for n in missing:
+                frac = max(0.0, min(1.0, (n - 1) / max(total_pages - 1, 1)))
+                try:
+                    page.evaluate(_SCROLL_TO_JS, frac)
+                    page.wait_for_timeout(1600)
+                except Exception:
+                    continue
+            page.wait_for_timeout(2000)
 
         page.wait_for_timeout(3000)  # in-flight images
+        _emit("finalize")
     finally:
         try:
             page.remove_listener("response", on_response)
@@ -442,12 +566,12 @@ def _capture_view_document(context, file_id: str) -> tuple[bytes, str]:
             "No page images captured from the Drive viewer", "RENDER_FAILED", 500
         )
 
-    pdf_bytes, _page_count = _assemble_pdf_from_images(captured_by_url)
+    pdf_bytes, _page_count = _assemble_pdf_from_images(captured_by_url, progress=progress)
     file_name = _clean_title_to_filename(page_title, f"{file_id}.pdf")
     return pdf_bytes, file_name
 
 
-def build_pdf(file_id: str) -> tuple[bytes, str]:
+def build_pdf(file_id: str, progress=None) -> tuple[bytes, str]:
     """Build PDF bytes for a Drive file ID. See module docstring."""
     if not file_id or not re.fullmatch(r"[A-Za-z0-9_-]{20,}", file_id):
         raise DownloadError("Invalid Drive file ID", "INVALID_URL", 400)
@@ -479,12 +603,14 @@ def build_pdf(file_id: str) -> tuple[bytes, str]:
                 ],
             )
             try:
+                # deviceScaleFactor=2 → Drive serves ~2x resolution page images
                 context = browser.new_context(
                     viewport={"width": 1600, "height": 1000},
+                    device_scale_factor=2,
                     user_agent=USER_AGENT,
                     accept_downloads=False,
                 )
-                return _capture_view_document(context, file_id)
+                return _capture_view_document(context, file_id, progress=progress)
             finally:
                 browser.close()
     except DownloadError:

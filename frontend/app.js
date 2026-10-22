@@ -45,6 +45,7 @@ let activeJobId = null;
 let pollTimer = null;
 let unsubscribeStatus = null;
 let pollElapsed = 0;
+let lastProgressSig = "";
 
 const STEP_ORDER = ['validate', 'cache', 'queue', 'render', 'output'];
 
@@ -260,6 +261,7 @@ async function getJobResult(jobId) {
 async function pollJob(jobId, onTick) {
   const started = Date.now();
   let delay = 1500;
+  let lastStable = '';
 
   for (;;) {
     await sleep(delay);
@@ -268,9 +270,9 @@ async function pollJob(jobId, onTick) {
     pollElapsed = Math.round((Date.now() - started) / 1000);
     if (onTick) onTick(body, pollElapsed);
     if (body.status === 'completed' || body.status === 'failed') return body;
-    // no hard cap: server enqueues and renders as fast as it can; user can
-    // always navigate away and the PDF lands in their "Saved" list on next
-    // visit ONLY if we complete here — so keep polling while tab is open.
+    // Safety: if the job record stops changing AND pages stall, keep polling
+    // anyway — the server may still be in a retry pass. No hard client cap.
+    void lastStable;
   }
 }
 
@@ -333,11 +335,38 @@ async function handleDownload() {
     });
 
     const final = await pollJob(activeJobId, (body, elapsed) => {
-      const pct = body.status === 'processing' ? Math.min(45 + elapsed * 0.5, 88) : 35;
-      setStage(
-        body.status === 'processing' ? `Capturing pages · ${elapsed}s` : 'Waiting for slot',
-        pct,
-      );
+      if (body.status !== 'processing') {
+        setStage('Waiting for a free slot', 32);
+        return;
+      }
+      // Real progress from the capture engine: pagesDone/pagesTotal and
+      // scrollPct. Fall back to scroll% alone when the viewer hides its count.
+      const total = body.pagesTotal;
+      const done = body.pagesDone;
+      let label;
+      let pct;
+      if (body.phase === 'retry') {
+        label = `Re-fetching missed pages · ${body.missing ?? '?'} left`;
+        pct = 88;
+      } else if (body.phase === 'assemble') {
+        label = `Building PDF · ${done}/${total ?? '?'}`;
+        pct = 94;
+      } else if (total && done != null) {
+        label = `Capturing page ${done}/${total}`;
+        pct = 30 + (done / total) * 55;
+      } else if (body.scrollPct != null) {
+        label = `Scanning document · ${Math.round(body.scrollPct)}%`;
+        pct = 30 + (body.scrollPct / 100) * 55;
+      } else {
+        label = `Capturing pages · ${elapsed}s`;
+        pct = 35;
+      }
+      setStage(label, pct);
+      const sig = `${done}/${total}/${body.phase || ''}`;
+      if (total && sig !== lastProgressSig) {
+        lastProgressSig = sig;
+        log(`page ${done ?? '?'}/${total}${body.phase === 'retry' ? ' · retrying missed' : ''}`, 'info');
+      }
       setSteps(3);
     });
     stopWatching();
