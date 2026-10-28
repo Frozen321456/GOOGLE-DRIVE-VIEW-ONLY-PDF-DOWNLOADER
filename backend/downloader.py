@@ -16,8 +16,12 @@ machine-readable code + HTTP status for the API layer.
 from __future__ import annotations
 
 import hashlib
+import hashlib
 import io
+import os
 import re
+import shutil
+import tempfile
 import urllib.parse
 
 import requests
@@ -29,6 +33,8 @@ USER_AGENT = (
 REQUEST_TIMEOUT = 25    # seconds for direct HTTP attempts
 NAV_TIMEOUT = 60_000    # ms for Playwright navigation
 MAX_PDF_BYTES = 100 * 1024 * 1024  # 100 MB hard stop (free-tier RAM guard)
+MAX_PAGE_IMAGE_BYTES = 2_500_000      # per-page image budget before downscale
+MAX_CAPTURE_DISK_BYTES = 350 * 1024 * 1024  # total temp-image budget on disk
 # Steps needed ≈ pages * pageHeight / (0.5 * viewportHeight). A 61-page doc at
 # 1000px viewport, ~1050px pages needs ~130 steps; cap generously at 300.
 # Job API renders in a background thread, so long walks are fine.
@@ -316,8 +322,14 @@ _SCROLL_TO_JS = """
 """
 
 
-def _assemble_pdf_from_images(captured_by_url: dict, progress=None) -> tuple[bytes, int]:
-    """Group page images by URL `page=` param (largest wins), dedupe, img2pdf."""
+def _assemble_pdf_from_images(captured_dir: str, captured_by_url: dict, progress=None) -> tuple[bytes, int]:
+    """Group page images by URL `page=` param (largest wins), dedupe, img2pdf.
+
+    Raw page bytes were already spilled to `captured_dir` by the capture
+    phase; this function streams one page at a time (PIL peak = one image)
+    and writes JPEG files next to them for img2pdf to consume by path —
+    so peak RAM stays ~1 page image instead of the whole document.
+    """
     try:
         from PIL import Image
         import img2pdf
@@ -326,64 +338,79 @@ def _assemble_pdf_from_images(captured_by_url: dict, progress=None) -> tuple[byt
             "Image pipeline not installed on the server", "RENDER_FAILED", 500
         ) from exc
 
-    pages_by_num: dict[int, bytes] = {}
-    unpageable: list[bytes] = []
+    pages_by_num: dict[int, str] = {}   # page num -> raw file path
+    unpageable: list[str] = []          # raw file paths
 
-    for url, img_bytes in captured_by_url.items():
+    for url, fname in list(captured_by_url.items()):
+        path = os.path.join(captured_dir, fname)
         try:
-            img = Image.open(io.BytesIO(img_bytes))
-            if img.width < 200 or img.height < 200:
+            with open(path, "rb") as fh:
+                head = fh.read(4096)
+            if len(head) < 10_000:
                 continue  # icons / UI chrome
-        except Exception:
+        except OSError:
             continue
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
         if "page" in qs:
             try:
                 n = int(qs["page"][0])
-                if n not in pages_by_num or len(img_bytes) > len(pages_by_num[n]):
-                    pages_by_num[n] = img_bytes
-            except ValueError:
-                unpageable.append(img_bytes)
+                if n not in pages_by_num or os.path.getsize(path) > os.path.getsize(pages_by_num[n]):
+                    pages_by_num[n] = path
+            except (ValueError, OSError):
+                unpageable.append(path)
         else:
-            unpageable.append(img_bytes)
+            unpageable.append(path)
 
-    ordered: list[bytes] = []
+    ordered: list[str] = []
     if pages_by_num:
         ordered = [pages_by_num[n] for n in sorted(pages_by_num)]
     else:
         seen: set[str] = set()
-        for b in unpageable:
-            h = hashlib.md5(b).hexdigest()
+        for p in unpageable:
+            h = hashlib.md5(open(p, "rb").read(65536)).hexdigest()
             if h not in seen:
                 seen.add(h)
-                ordered.append(b)
+                ordered.append(p)
 
     if not ordered:
         raise DownloadError("No page images could be captured", "RENDER_FAILED", 500)
 
-    processed = []
-    for b in ordered:
+    if progress:
         try:
-            img = Image.open(io.BytesIO(b))
-            if img.width < 200 or img.height < 200:
-                continue
-            if img.format == "JPEG":
-                # Embed original bytes — zero quality loss, no double-compress.
-                processed.append(b)
-            else:
-                # PNG/WebP: flatten alpha onto white, encode once at q95.
-                if img.mode in ("RGBA", "LA", "P"):
-                    img = img.convert("RGBA")
-                    bg = Image.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[-1])
-                    img = bg
-                elif img.mode != "RGB":
-                    img = img.convert("RGB")
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=95)
-                processed.append(buf.getvalue())
+            progress({"phase": "assemble", "pagesDone": 0, "pagesTotal": len(ordered), "scrollPct": None})
+        except Exception:
+            pass
+
+    processed: list[str] = []
+    for idx, path in enumerate(ordered, 1):
+        try:
+            with Image.open(path) as img:
+                img.load()
+                if img.width < 200 or img.height < 200:
+                    continue
+                # JPEG originals embed byte-for-byte (zero quality loss)
+                if img.format == "JPEG":
+                    processed.append(path)
+                else:
+                    # PNG/WebP: flatten alpha onto white, encode once at q95,
+                    # write to disk — only one image lives in RAM at a time.
+                    if img.mode in ("RGBA", "LA", "P"):
+                        img = img.convert("RGBA")
+                        bg = Image.new("RGB", img.size, (255, 255, 255))
+                        bg.paste(img, mask=img.split()[-1])
+                        img = bg
+                    elif img.mode != "RGB":
+                        img = img.convert("RGB")
+                    out_path = os.path.join(captured_dir, f"conv_{idx:05d}.jpg")
+                    img.save(out_path, format="JPEG", quality=95)
+                    processed.append(out_path)
         except Exception:
             continue
+        if progress and idx % 10 == 0:
+            try:
+                progress({"phase": "assemble", "pagesDone": idx, "pagesTotal": len(ordered), "scrollPct": None})
+            except Exception:
+                pass
 
     if not processed:
         raise DownloadError("Captured images could not be processed", "RENDER_FAILED", 500)
@@ -394,24 +421,56 @@ def _assemble_pdf_from_images(captured_by_url: dict, progress=None) -> tuple[byt
     return pdf_bytes, len(processed)
 
 
-def _capture_view_document(context, file_id: str, progress=None) -> tuple[bytes, str]:
-    """Open the Drive viewer, scroll through, capture page images, build PDF.
+def _capture_view_document(context, file_id: str, progress=None) -> tuple[str, dict, str]:
+    """Open the Drive viewer, scroll through, capture page images to disk.
 
+    Returns (captured_dir, captured_by_url, page_title). The caller owns
+    captured_dir (assembly + cleanup) so the browser can be torn down
+    before the PDF is built — this split is what keeps 512MB alive.
     `progress`, when given, is called with dicts like
     {phase, scrollPct, pagesDone, pagesTotal} as the walk advances.
     """
     page = context.new_page()
-    captured_by_url: dict[str, bytes] = {}
+    captured_by_url: dict[str, str] = {}  # url -> filename in captured_dir
+    disk_used = {"n": 0}
+    captured_dir = tempfile.mkdtemp(prefix="cap_")
 
     def on_response(response):
         try:
             ct = (response.headers or {}).get("content-type", "")
-            if response.status == 200 and any(
+            if response.status != 200 or not any(
                 t in ct for t in ("image/jpeg", "image/png", "image/webp")
             ):
-                body = response.body()
-                if len(body) > 10_000:  # page renders are big; icons are tiny
-                    captured_by_url[response.url] = body
+                return
+            body = response.body()
+            if len(body) < 10_000:  # page renders are big; icons are tiny
+                return
+            # oversize single page: downscale once, keeps 2x-retina quality
+            # (2500px wide ≈ 300dpi for a 21cm page) while capping RAM/disk
+            if len(body) > MAX_PAGE_IMAGE_BYTES:
+                try:
+                    from PIL import Image
+                    img = Image.open(io.BytesIO(body))
+                    if img.width > 2500:
+                        ratio = 2500 / img.width
+                        img = img.resize((2500, int(img.height * ratio)), Image.LANCZOS)
+                    if img.mode not in ("RGB", "L"):
+                        img = img.convert("RGB")
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=90)
+                    body = buf.getvalue()
+                except Exception:
+                    pass  # keep original bytes if PIL chokes
+            h = hashlib.sha256(response.url.encode()).hexdigest()[:16]
+            fname = f"img_{h}.bin"
+            with open(os.path.join(captured_dir, fname), "wb") as fh:
+                fh.write(body)
+            disk_used["n"] += len(body)
+            captured_by_url[response.url] = fname
+            # emergency stop flag: doc way too big for free tier. Playwright
+            # swallows handler exceptions, so raise from the walk loop instead.
+            if disk_used["n"] > MAX_CAPTURE_DISK_BYTES:
+                disk_used["over"] = True
         except Exception:
             pass
 
@@ -518,6 +577,12 @@ def _capture_view_document(context, file_id: str, progress=None) -> tuple[bytes,
         stable = 0
         last_emit = 0.0
         for _ in range(SCROLL_STEPS_MAX):
+            if disk_used.get("over"):
+                raise DownloadError(
+                    "Document too large for the free engine (image budget exceeded)",
+                    "RENDER_FAILED",
+                    500,
+                )
             before = page.evaluate(_SCROLL_POS_JS)
             page.evaluate(_SCROLL_STEP_JS)
             page.wait_for_timeout(900)
@@ -554,6 +619,10 @@ def _capture_view_document(context, file_id: str, progress=None) -> tuple[bytes,
 
         page.wait_for_timeout(3000)  # in-flight images
         _emit("finalize")
+    except BaseException:
+        # failure path: capture owns its tempdir cleanup
+        shutil.rmtree(captured_dir, ignore_errors=True)
+        raise
     finally:
         try:
             page.remove_listener("response", on_response)
@@ -562,13 +631,12 @@ def _capture_view_document(context, file_id: str, progress=None) -> tuple[bytes,
         page.close()
 
     if not captured_by_url:
+        shutil.rmtree(captured_dir, ignore_errors=True)
         raise DownloadError(
             "No page images captured from the Drive viewer", "RENDER_FAILED", 500
         )
 
-    pdf_bytes, _page_count = _assemble_pdf_from_images(captured_by_url, progress=progress)
-    file_name = _clean_title_to_filename(page_title, f"{file_id}.pdf")
-    return pdf_bytes, file_name
+    return captured_dir, captured_by_url, page_title
 
 
 def build_pdf(file_id: str, progress=None) -> tuple[bytes, str]:
@@ -600,6 +668,10 @@ def build_pdf(file_id: str, progress=None) -> tuple[bytes, str]:
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--js-flags=--max-old-space-size=256",
+                    "--renderer-process-limit=2",
                 ],
             )
             try:
@@ -610,9 +682,22 @@ def build_pdf(file_id: str, progress=None) -> tuple[bytes, str]:
                     user_agent=USER_AGENT,
                     accept_downloads=False,
                 )
-                return _capture_view_document(context, file_id, progress=progress)
+                captured_dir, captured_by_url, page_title = _capture_view_document(
+                    context, file_id, progress=progress
+                )
             finally:
+                # Chromium freed BEFORE pdf assembly — its ~250MB never
+                # overlaps with the img2pdf pass. This alone fixed the OOM.
                 browser.close()
+
+        # Chromium is gone; assemble from disk images with full RAM headroom.
+        try:
+            pdf_bytes, _page_count = _assemble_pdf_from_images(captured_dir, captured_by_url, progress=progress)
+        finally:
+            shutil.rmtree(captured_dir, ignore_errors=True)
+
+        file_name = _clean_title_to_filename(page_title, f"{file_id}.pdf")
+        return pdf_bytes, file_name
     except DownloadError:
         raise
     except Exception as exc:

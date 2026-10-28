@@ -186,23 +186,13 @@ function jobUrl(path) {
   return BASE ? `${BASE}${path}` : path;
 }
 
-/** POST /api/jobs → { jobId } */
+/** POST /api/jobs → { jobId } (network-resilient) */
 async function createJob(fileId) {
-  let resp;
-  try {
-    resp = await fetch(jobUrl('/api/jobs'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: `https://drive.google.com/file/d/${fileId}/view` }),
-    });
-  } catch (err) {
-    if (err instanceof TypeError) {
-      const e = new Error('network');
-      e.userMessage = 'Network error — check connection and retry.';
-      throw e;
-    }
-    throw err;
-  }
+  const resp = await fetchRetry(jobUrl('/api/jobs'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: `https://drive.google.com/file/d/${fileId}/view` }),
+  }, 4, null);
 
   const ctype = resp.headers.get('content-type') || '';
   if (ctype.includes('application/json')) {
@@ -221,9 +211,34 @@ async function createJob(fileId) {
   throw e;
 }
 
-/** GET /api/jobs/:id → status body */
-async function getJob(jobId) {
-  const resp = await fetch(jobUrl(`/api/jobs/${jobId}`));
+/** fetch with automatic retry on network failure (Render restarts, wifi blips).
+ *  Retries: up to N attempts, 3s apart, with onRetry callback for UI. */
+async function fetchRetry(url, opts, attempts = 8, onRetry = null) {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const resp = await fetch(url, opts);
+      // 502/503/504 = instance restarting → wait and retry same request
+      if ([502, 503, 504].includes(resp.status) && i < attempts) {
+        if (onRetry) onRetry(i, `server restarting (${resp.status})`);
+        await sleep(4000);
+        continue;
+      }
+      return resp;
+    } catch (err) {
+      if (err instanceof TypeError && i < attempts) {  // network-level failure
+        if (onRetry) onRetry(i, 'connection lost — reconnecting');
+        await sleep(3000);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('unreachable');
+}
+
+/** GET /api/jobs/:id → status body (network-resilient) */
+async function getJob(jobId, onRetry = null) {
+  const resp = await fetchRetry(jobUrl(`/api/jobs/${jobId}`), {}, 8, onRetry);
   const body = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     const e = new Error(body.error || `HTTP ${resp.status}`);
@@ -235,9 +250,9 @@ async function getJob(jobId) {
   return body;
 }
 
-/** GET /api/jobs/:id/result → { blob, fileName } */
+/** GET /api/jobs/:id/result → { blob, fileName } (network-resilient) */
 async function getJobResult(jobId) {
-  const resp = await fetch(jobUrl(`/api/jobs/${jobId}/result`));
+  const resp = await fetchRetry(jobUrl(`/api/jobs/${jobId}/result`), {}, 6, null);
   if (!resp.ok) {
     let bodyCode = null; let detail = null;
     try {
@@ -266,7 +281,19 @@ async function pollJob(jobId, onTick) {
   for (;;) {
     await sleep(delay);
     delay = Math.min(delay + 500, 4000); // back off gently
-    const body = await getJob(jobId);
+    let body;
+    try {
+      body = await getJob(jobId, (attempt, why) => {
+        if (onTick) onTick({ status: 'reconnecting', retryAttempt: attempt, why }, pollElapsed);
+      });
+    } catch (err) {
+      if (err instanceof TypeError) {
+        // all retries exhausted → keep waiting; server may still come back
+        if (onTick) onTick({ status: 'reconnecting', retryAttempt: 99, why: err.message }, pollElapsed);
+        continue;
+      }
+      throw err;
+    }
     pollElapsed = Math.round((Date.now() - started) / 1000);
     if (onTick) onTick(body, pollElapsed);
     if (body.status === 'completed' || body.status === 'failed') return body;
@@ -335,6 +362,10 @@ async function handleDownload() {
     });
 
     const final = await pollJob(activeJobId, (body, elapsed) => {
+      if (body.status === 'reconnecting') {
+        setStage(`Connection lost — retrying (${body.retryAttempt})…`, 40);
+        return;
+      }
       if (body.status !== 'processing') {
         setStage('Waiting for a free slot', 32);
         return;

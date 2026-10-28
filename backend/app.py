@@ -150,6 +150,18 @@ def _run_job(job_id: str, file_id: str) -> None:
                     j.pop("result", None)
         threading.Thread(target=_gc, daemon=True).start()
 
+        # payload consumed → free it immediately once downloaded (jobs/<id>/result
+        # sets job["_consumed"]; sweep clears it on next request)
+        with JOBS_LOCK:
+            _dead = [
+                jid for jid, j in JOBS.items()
+                if j.get("status") in ("completed", "failed")
+                and (j.get("_consumed") or time.time() - j.get("finishedAt", 0) > RESULT_TTL)
+                and time.time() - j.get("finishedAt", 0) > 60
+            ]
+            for jid in _dead:
+                JOBS.pop(jid, None)
+
 
 @app.get("/api/health")
 def health():
@@ -276,7 +288,8 @@ def job_result(job_id: str):
         return jsonify({"error": "Result not ready", "code": "NOT_READY"}), 409
 
     pdf_bytes = job["result"]
-    return Response(
+    job["_consumed"] = True
+    resp = Response(
         pdf_bytes,
         mimetype="application/pdf",
         headers={
@@ -285,6 +298,16 @@ def job_result(job_id: str):
             "Cache-Control": "no-store",
         },
     )
+
+    @resp.call_on_close
+    def _free_payload():
+        # bytes handed to the socket → drop the in-RAM copy right away
+        with JOBS_LOCK:
+            j = JOBS.get(job_id)
+            if j is not None:
+                j.pop("result", None)
+
+    return resp
 
 
 # ---- init Firebase once at import (Admin SDK bypasses RTDB rules) ----
