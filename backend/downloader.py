@@ -576,6 +576,7 @@ def _capture_view_document(context, file_id: str, progress=None) -> tuple[str, d
         # own page count and re-scroll to any missing pages.
         stable = 0
         last_emit = 0.0
+        step_i = 0
         for _ in range(SCROLL_STEPS_MAX):
             if disk_used.get("over"):
                 raise DownloadError(
@@ -587,6 +588,30 @@ def _capture_view_document(context, file_id: str, progress=None) -> tuple[str, d
             page.evaluate(_SCROLL_STEP_JS)
             page.wait_for_timeout(900)
             after = page.evaluate(_SCROLL_POS_JS)
+            step_i += 1
+            if step_i % 12 == 0:
+                # Renderer bitmap bleed fix: Drive keeps every visited page's
+                # decoded image in the DOM; force-free far-offscreen ones.
+                try:
+                    page.evaluate(
+                        """() => {
+                            let freed = 0;
+                            for (const img of document.querySelectorAll('img')) {
+                                const r = img.getBoundingClientRect();
+                                if (r.bottom < -2500 || r.top > window.innerHeight + 2500) {
+                                    if (img.src && !img.dataset.sweep) {
+                                        img.dataset.sweep = '1';
+                                        img.removeAttribute('src');
+                                        img.srcset = '';
+                                        freed++;
+                                    }
+                                }
+                            }
+                            return freed;
+                        }"""
+                    )
+                except Exception:
+                    pass
             if after - before >= 0 and (after - last_emit) > 0:  # emit per step
                 _emit("render")
                 last_emit = after
@@ -670,14 +695,20 @@ def build_pdf(file_id: str, progress=None) -> tuple[bytes, str]:
                     "--disable-gpu",
                     "--disable-extensions",
                     "--disable-background-networking",
-                    "--js-flags=--max-old-space-size=256",
-                    "--renderer-process-limit=2",
+                    "--disable-back-forward-cache",
+                    "--disable-software-rasterizer",
+                    "--process-per-site",
+                    "--renderer-process-limit=1",
+                    "--js-flags=--max-old-space-size=192",
                 ],
             )
             try:
-                # deviceScaleFactor=2 → Drive serves ~2x resolution page images
+                # deviceScaleFactor=2 → Drive serves ~2x resolution page
+                # images (288 DPI at 1200px width — quality preserved).
+                # 1200x800 keeps decoded renderer bitmaps at ~32MB/page
+                # instead of ~57MB (1600px) — this is what stops the OOM.
                 context = browser.new_context(
-                    viewport={"width": 1600, "height": 1000},
+                    viewport={"width": 1200, "height": 800},
                     device_scale_factor=2,
                     user_agent=USER_AGENT,
                     accept_downloads=False,
