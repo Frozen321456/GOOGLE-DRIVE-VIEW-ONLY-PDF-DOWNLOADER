@@ -374,7 +374,7 @@ def create_job():
     with JOBS_LOCK:
         now = time.time()
         for jid, j in JOBS.items():
-            if j.get("fileId") != file_id:
+            if j.get("fileId") != file_id or j.get("continuation"):
                 continue
             if j.get("status") in ("queued", "processing"):
                 return jsonify({"jobId": jid, "status": j["status"], "reused": True}), 202

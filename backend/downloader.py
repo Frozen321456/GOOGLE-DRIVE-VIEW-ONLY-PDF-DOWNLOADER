@@ -679,6 +679,20 @@ def _capture_view_document(context, file_id: str, progress=None, start_after_pag
             page.wait_for_timeout(900)
             after = page.evaluate(_SCROLL_POS_JS)
             step_i += 1
+            # memory-wall trigger: fire the checkpoint the moment we cross
+            # 40 captured pages and the viewer says more exist. Waiting for
+            # the walk's natural bottom OOMs first (verified 4x).
+            have_now = _captured_page_nums()
+            if len(have_now) >= 40:
+                tp_now = _total_pages_from_viewer()
+                if tp_now and len(have_now) < tp_now:
+                    raise CheckpointReached(
+                        pages_so_far=len(have_now),
+                        total=tp_now,
+                        captured_dir=captured_dir,
+                        captured_by_url=captured_by_url,
+                        page_title=page_title,
+                    )
             if step_i % 3 == 0:
                 # Renderer bitmap bleed fix: Drive keeps every visited page's
                 # decoded image in the DOM; force-free far-offscreen ones
