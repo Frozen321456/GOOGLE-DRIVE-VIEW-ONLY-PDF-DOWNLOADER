@@ -272,8 +272,12 @@ async function getJobResult(jobId) {
   return { blob, fileName };
 }
 
-/** Poll job until terminal state. Resolves with final status body. */
-async function pollJob(jobId, onTick) {
+/** Poll job until terminal state. Resolves with final status body.
+ *  fileId enables one automatic resubmit when the backend restarts
+ *  mid-render and forgets the job (404). */
+async function pollJob(jobId, onTick, fileId = null) {
+  let currentFileId = fileId;
+  let resubmitted = false;
   const started = Date.now();
   let delay = 1500;
   let lastStable = '';
@@ -291,6 +295,20 @@ async function pollJob(jobId, onTick) {
         // all retries exhausted → keep waiting; server may still come back
         if (onTick) onTick({ status: 'reconnecting', retryAttempt: 99, why: err.message }, pollElapsed);
         continue;
+      }
+      // 404 Unknown job = instance restarted and lost its in-memory
+      // registry. Resubmit the same file once, follow the new job.
+      if (err.httpCode === 404 && !resubmitted && currentFileId) {
+        resubmitted = true;
+        if (onTick) onTick({ status: 'resubmitting' }, pollElapsed);
+        try {
+          const nj = await createJob(currentFileId);
+          jobId = nj.jobId;
+          delay = 1500;
+          continue;
+        } catch {
+          // resubmit failed → surface error to user
+        }
       }
       throw err;
     }
@@ -362,6 +380,10 @@ async function handleDownload() {
     });
 
     const final = await pollJob(activeJobId, (body, elapsed) => {
+      if (body.status === 'resubmitting') {
+        setStage('Engine restarted — re-submitting your file', 30);
+        return;
+      }
       if (body.status === 'reconnecting') {
         setStage(`Connection lost — retrying (${body.retryAttempt})…`, 40);
         return;
@@ -399,7 +421,7 @@ async function handleDownload() {
         log(`page ${done ?? '?'}/${total}${body.phase === 'retry' ? ' · retrying missed' : ''}`, 'info');
       }
       setSteps(3);
-    });
+    }, fileId);
     stopWatching();
 
     if (final.status === 'failed') {

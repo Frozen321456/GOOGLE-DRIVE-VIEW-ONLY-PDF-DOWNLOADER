@@ -421,6 +421,42 @@ def _assemble_pdf_from_images(captured_dir: str, captured_by_url: dict, progress
     return pdf_bytes, len(processed)
 
 
+def _cap_image_width(url: str, cap: int = 2000) -> str | None:
+    """Rewrite a Drive viewer image URL so its width never exceeds `cap`.
+
+    Drive serves page images sized to the viewport at deviceScaleFactor=2
+    (up to w3200). A decoded w3200 bitmap is ~56MB of renderer RAM and the
+    decode cache keeps a rolling window of them → OOM at ~page 45 on a
+    512MB box. Capping the request at the network layer keeps decoded
+    pages at ~22MB each without touching visual quality (242 DPI on A4).
+    Returns the rewritten URL, or None when no rewrite is needed.
+    """
+    m = re.search(r"=w(\d+)-h(\d+)", url)  # googleusercontent-style suffix
+    if m:
+        w0, h0 = int(m.group(1)), int(m.group(2))
+        if w0 <= cap:
+            return None
+        h1 = max(1, round(h0 * cap / w0))
+        return re.sub(r"=w\d+-h\d+", f"=w{cap}-h{h1}", url, count=1)
+    parsed = urllib.parse.urlparse(url)
+    if "viewerng/img" not in parsed.path and "/img?" not in parsed.path:
+        return None
+    qpairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    w0 = next((int(v) for k, v in qpairs if k == "w" and v.isdigit()), 0)
+    if not w0 or w0 <= cap:
+        return None
+    h0 = next((int(v) for k, v in qpairs if k == "h" and v.isdigit()), 0)
+    new_q = []
+    for k, v in qpairs:
+        if k == "w":
+            new_q.append((k, str(cap)))
+        elif k == "h" and h0:
+            new_q.append((k, str(max(1, round(h0 * cap / w0)))))
+        else:
+            new_q.append((k, v))
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(new_q)))
+
+
 def _capture_view_document(context, file_id: str, progress=None) -> tuple[str, dict, str]:
     """Open the Drive viewer, scroll through, capture page images to disk.
 
@@ -434,6 +470,27 @@ def _capture_view_document(context, file_id: str, progress=None) -> tuple[str, d
     captured_by_url: dict[str, str] = {}  # url -> filename in captured_dir
     disk_used = {"n": 0}
     captured_dir = tempfile.mkdtemp(prefix="cap_")
+
+    # Cap page-image width at the network layer: w3200 bitmaps are what
+    # kills the 512MB renderer. 2000px keeps 242 DPI (print-quality) at
+    # ~22MB decoded per page instead of ~56MB.
+    def _route_rewrite(route):
+        try:
+            rewritten = _cap_image_width(route.request.url, cap=2000)
+            if rewritten:
+                route.continue_(url=rewritten)
+                return
+        except Exception:
+            pass
+        try:
+            route.continue_()
+        except Exception:
+            pass
+
+    try:
+        page.route("**/*", _route_rewrite)
+    except Exception:
+        pass  # interception unavailable → fall back to old behavior
 
     def on_response(response):
         try:
@@ -589,16 +646,17 @@ def _capture_view_document(context, file_id: str, progress=None) -> tuple[str, d
             page.wait_for_timeout(900)
             after = page.evaluate(_SCROLL_POS_JS)
             step_i += 1
-            if step_i % 12 == 0:
+            if step_i % 3 == 0:
                 # Renderer bitmap bleed fix: Drive keeps every visited page's
-                # decoded image in the DOM; force-free far-offscreen ones.
+                # decoded image in the DOM; force-free far-offscreen ones
+                # (wide range: the scroll step is ~400px, decode window larger).
                 try:
                     page.evaluate(
                         """() => {
                             let freed = 0;
                             for (const img of document.querySelectorAll('img')) {
                                 const r = img.getBoundingClientRect();
-                                if (r.bottom < -2500 || r.top > window.innerHeight + 2500) {
+                                if (r.bottom < -4000 || r.top > window.innerHeight + 4000) {
                                     if (img.src && !img.dataset.sweep) {
                                         img.dataset.sweep = '1';
                                         img.removeAttribute('src');
