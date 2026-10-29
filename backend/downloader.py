@@ -871,6 +871,8 @@ def build_pdf(file_id: str, progress=None, start_after_page: int = 0) -> tuple[b
         return pdf_bytes, file_name
     except DownloadError:
         raise
+    except CheckpointReached:
+        raise  # job layer assembles the part — never wrap as failure
     except Exception as exc:
         raise DownloadError(f"Playwright render failed: {exc}", "RENDER_FAILED", 500) from exc
     finally:
