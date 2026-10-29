@@ -431,6 +431,12 @@ async function handleDownload() {
       });
     }
 
+    if (final.partInfo) {
+      const p = final.partInfo;
+      log(`large document: part 1 covers pages 1-${p.pagesDone} of ${p.pagesTotal}`, 'warn');
+      log('remaining pages render next — check saved list shortly for part 2', 'info');
+    }
+
     // output
     setSteps(4);
     setStage('Downloading result', 92);

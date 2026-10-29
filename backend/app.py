@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
-from downloader import build_pdf, DownloadError
+from downloader import build_pdf, DownloadError, CheckpointReached
 from firebase_client import init_firebase, set_status
 
 load_dotenv()
@@ -78,6 +78,95 @@ def _extract_file_id(payload: dict) -> str | None:
     return extract_file_id(str(raw))
 
 
+def _checkpoint_name(page_title: str, pages_so_far: int) -> str:
+    """Filename for a checkpoint part-1 PDF."""
+    from downloader import _clean_title_to_filename
+    base = _clean_title_to_filename(page_title, "document")
+    stem = base[:-4] if base.lower().endswith(".pdf") else base
+    return f"{stem} (pages 1-{pages_so_far}).pdf"
+
+
+def _run_continuation(job_id: str, file_id: str, after_page: int) -> None:
+    """Render pages after_page+1..end in a FRESH browser (memory reset).
+
+    Reuses the same Chromium pipeline but tells the capture layer to stop
+    at the memory wall again if needed (multi-part chain for huge docs).
+    """
+    with _RENDER_SEM:
+        job = JOBS.get(job_id)
+        if job is None:
+            return
+        job["status"] = "processing"
+        job["startedAt"] = time.time()
+        set_status(file_id, "processing", jobId=job_id,
+                   continuation=True, afterPage=after_page)
+
+        def on_progress(info: dict):
+            job.update(
+                phase=info.get("phase"),
+                scrollPct=info.get("scrollPct"),
+                pagesDone=info.get("pagesDone"),
+                pagesTotal=info.get("pagesTotal"),
+                progressAt=time.time(),
+            )
+
+        try:
+            pdf_bytes, file_name = build_pdf(
+                file_id, progress=on_progress, start_after_page=after_page
+            )
+        except CheckpointReached as cp:
+            from downloader import _assemble_pdf_from_images
+            try:
+                part_bytes, _ = _assemble_pdf_from_images(
+                    cp.captured_dir, cp.captured_by_url, progress=on_progress
+                )
+            finally:
+                import shutil
+                shutil.rmtree(cp.captured_dir, ignore_errors=True)
+            lo, hi = after_page + 1, cp.pages_so_far
+            part_name = _cont_name(file_id, lo, hi)
+            job.update(status="completed", fileName=part_name,
+                       size=len(part_bytes), result=part_bytes,
+                       finishedAt=time.time(),
+                       partInfo={"part": (after_page // 40) + 2,
+                                  "pagesDone": hi, "pagesTotal": cp.total,
+                                  "nextFileId": file_id})
+            set_status(file_id, "processing", jobId=job_id,
+                       partDone=f"{lo}-{hi}")
+            if cp.pages_so_far < cp.total:
+                # still more → chain another continuation
+                def _chain2():
+                    time.sleep(3)
+                    nid = uuid.uuid4().hex[:16]
+                    with JOBS_LOCK:
+                        JOBS[nid] = {"jobId": nid, "fileId": file_id,
+                                     "status": "queued", "createdAt": time.time(),
+                                     "continuation": {"afterPage": cp.pages_so_far}}
+                    threading.Thread(target=_run_continuation,
+                                     args=(nid, file_id, cp.pages_so_far),
+                                     daemon=True).start()
+                threading.Thread(target=_chain2, daemon=True).start()
+            return
+        except (DownloadError, Exception) as exc:
+            code = exc.code if isinstance(exc, DownloadError) else "RENDER_FAILED"
+            job.update(status="failed", error=str(exc), code=code,
+                       finishedAt=time.time())
+            set_status(file_id, "failed", error=f"continuation failed: {exc}",
+                       jobId=job_id)
+            return
+
+        job.update(status="completed", fileName=file_name,
+                   size=len(pdf_bytes), result=pdf_bytes,
+                   finishedAt=time.time())
+        set_status(file_id, "completed", fileName=file_name,
+                   size=len(pdf_bytes), jobId=job_id,
+                   completedAt=int(time.time() * 1000))
+
+
+def _cont_name(file_id: str, lo: int, hi: int) -> str:
+    return f"document (pages {lo}-{hi}).pdf"
+
+
 def _run_job(job_id: str, file_id: str) -> None:
     """Background worker: build the PDF, store result, update RTDB.
 
@@ -113,6 +202,61 @@ def _run_job(job_id: str, file_id: str) -> None:
 
         try:
             pdf_bytes, file_name = build_pdf(file_id, progress=on_progress)
+        except CheckpointReached as cp:
+            # 512MB memory wall: assemble what we captured (pages 1..N),
+            # deliver it, then queue a continuation job for the rest.
+            from downloader import _assemble_pdf_from_images
+            try:
+                part_bytes, part_count = _assemble_pdf_from_images(
+                    cp.captured_dir, cp.captured_by_url, progress=on_progress
+                )
+            finally:
+                import shutil
+                shutil.rmtree(cp.captured_dir, ignore_errors=True)
+            part_name = _checkpoint_name(cp.page_title, cp.pages_so_far)
+            job.update(
+                status="completed",
+                fileName=part_name,
+                size=len(part_bytes),
+                result=part_bytes,
+                finishedAt=time.time(),
+                partInfo={
+                    "part": 1,
+                    "pagesDone": cp.pages_so_far,
+                    "pagesTotal": cp.total,
+                    "nextFileId": file_id,
+                },
+            )
+            set_status(
+                file_id,
+                "completed",
+                fileName=part_name,
+                size=len(part_bytes),
+                jobId=job_id,
+                completedAt=int(time.time() * 1000),
+                part=1,
+                pagesDone=cp.pages_so_far,
+                pagesTotal=cp.total,
+            )
+            # continuation: after TTL, remaining pages get their own render
+            def _chain():
+                time.sleep(3)
+                cont_job_id = uuid.uuid4().hex[:16]
+                with JOBS_LOCK:
+                    JOBS[cont_job_id] = {
+                        "jobId": cont_job_id,
+                        "fileId": file_id,
+                        "status": "queued",
+                        "createdAt": time.time(),
+                        "continuation": {"afterPage": cp.pages_so_far},
+                    }
+                threading.Thread(
+                    target=_run_continuation,
+                    args=(cont_job_id, file_id, cp.pages_so_far),
+                    daemon=True,
+                ).start()
+            threading.Thread(target=_chain, daemon=True).start()
+            return
         except DownloadError as exc:
             job.update(status="failed", error=str(exc), code=exc.code,
                        finishedAt=time.time())
@@ -268,9 +412,14 @@ def job_status(job_id: str):
             scrollPct=job.get("scrollPct"),
             pagesDone=job.get("pagesDone"),
             pagesTotal=job.get("pagesTotal"),
+            continuation=job.get("continuation"),
         )
     elif job.get("status") == "completed":
-        body.update(fileName=job.get("fileName"), size=job.get("size"))
+        body.update(
+            fileName=job.get("fileName"),
+            size=job.get("size"),
+            partInfo=job.get("partInfo"),
+        )
     elif job.get("status") == "failed":
         body.update(error=job.get("error"), code=job.get("code"))
     return jsonify(body), 200

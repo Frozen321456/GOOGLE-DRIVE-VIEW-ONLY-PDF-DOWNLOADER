@@ -51,6 +51,23 @@ class DownloadError(Exception):
         self.http_status = http_status
 
 
+class CheckpointReached(Exception):
+    """Raised when capture must stop early (512MB memory wall).
+
+    Carries everything needed to assemble a PART-1 PDF now and hand the
+    remaining pages to a continuation job.
+    """
+
+    def __init__(self, pages_so_far: int, total: int, captured_dir: str,
+                 captured_by_url: dict, page_title: str):
+        super().__init__(f"checkpoint at page {pages_so_far}/{total}")
+        self.pages_so_far = pages_so_far
+        self.total = total
+        self.captured_dir = captured_dir
+        self.captured_by_url = captured_by_url
+        self.page_title = page_title
+
+
 def extract_file_id(raw: str) -> str | None:
     """Pull a Drive file ID out of any common URL form, or a raw ID."""
     if not raw:
@@ -457,7 +474,7 @@ def _cap_image_width(url: str, cap: int = 2000) -> str | None:
     return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(new_q)))
 
 
-def _capture_view_document(context, file_id: str, progress=None) -> tuple[str, dict, str]:
+def _capture_view_document(context, file_id: str, progress=None, start_after_page: int = 0) -> tuple[str, dict, str]:
     """Open the Drive viewer, scroll through, capture page images to disk.
 
     Returns (captured_dir, captured_by_url, page_title). The caller owns
@@ -540,6 +557,22 @@ def _capture_view_document(context, file_id: str, progress=None) -> tuple[str, d
             timeout=NAV_TIMEOUT,
         )
         page.wait_for_timeout(5000)  # viewer init + first pages render
+
+        # Continuation render: fast-forward past pages we already have.
+        if start_after_page > 0:
+            for _ in range(SCROLL_STEPS_MAX):
+                pos = page.evaluate(_SCROLL_POS_JS)
+                page.evaluate(_SCROLL_STEP_JS)
+                page.wait_for_timeout(450)
+                pos2 = page.evaluate(_SCROLL_POS_JS)
+                have = {int(urllib.parse.parse_qs(urllib.parse.urlparse(u).query)["page"][0])
+                        for u in captured_by_url
+                        if "page" in urllib.parse.parse_qs(urllib.parse.urlparse(u).query)}
+                if any(n > start_after_page for n in have):
+                    break
+                if pos2 == pos:
+                    break  # bottom — doc shorter than expected
+            # first walk loop below now captures from here onward
 
         # Login redirect / error page detection
         if "accounts.google.com" in (page.url or ""):
@@ -680,6 +713,22 @@ def _capture_view_document(context, file_id: str, progress=None) -> tuple[str, d
             else:
                 stable = 0
 
+        # ── MEMORY WALL CHECKPOINT ────────────────────────────────────
+        # On 512MB free tier the viewer's bitmap window OOMs around page
+        # ~60 no matter what we cap (4x verified). So: if we've captured
+        # a healthy number of pages and are approaching the wall, stop
+        # here and emit a checkpoint marker the job layer understands.
+        pages_so_far = len(_captured_page_nums())
+        total_pages_now = _total_pages_from_viewer()
+        if total_pages_now and pages_so_far >= 40 and pages_so_far < total_pages_now:
+            raise CheckpointReached(
+                pages_so_far=pages_so_far,
+                total=total_pages_now,
+                captured_dir=captured_dir,
+                captured_by_url=captured_by_url,
+                page_title=page_title,
+            )
+
         # Retry passes: jump directly to the fractional positions of missing
         # pages (fast) instead of re-walking the whole document.
         total_pages = _total_pages_from_viewer()
@@ -722,8 +771,12 @@ def _capture_view_document(context, file_id: str, progress=None) -> tuple[str, d
     return captured_dir, captured_by_url, page_title
 
 
-def build_pdf(file_id: str, progress=None) -> tuple[bytes, str]:
-    """Build PDF bytes for a Drive file ID. See module docstring."""
+def build_pdf(file_id: str, progress=None, start_after_page: int = 0) -> tuple[bytes, str]:
+    """Build PDF bytes for a Drive file ID. See module docstring.
+
+    start_after_page > 0 = continuation render: only pages after that
+    number are captured (fresh browser, memory wall reset).
+    """
     if not file_id or not re.fullmatch(r"[A-Za-z0-9_-]{20,}", file_id):
         raise DownloadError("Invalid Drive file ID", "INVALID_URL", 400)
 
@@ -772,7 +825,8 @@ def build_pdf(file_id: str, progress=None) -> tuple[bytes, str]:
                     accept_downloads=False,
                 )
                 captured_dir, captured_by_url, page_title = _capture_view_document(
-                    context, file_id, progress=progress
+                    context, file_id, progress=progress,
+                    start_after_page=start_after_page
                 )
             finally:
                 # Chromium freed BEFORE pdf assembly — its ~250MB never
