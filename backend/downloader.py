@@ -54,14 +54,17 @@ class DownloadError(Exception):
 class CheckpointReached(Exception):
     """Raised when capture must stop early (512MB memory wall).
 
-    Carries everything needed to assemble a PART-1 PDF now and hand the
-    remaining pages to a continuation job.
+    Carries everything needed to assemble a PART PDF now and hand the
+    remaining pages to a continuation job. pages_so_far is a COUNT of
+    captured pages; max_page is the highest ABSOLUTE page number seen
+    (they differ in continuation renders, which start mid-document).
     """
 
-    def __init__(self, pages_so_far: int, total: int, captured_dir: str,
-                 captured_by_url: dict, page_title: str):
-        super().__init__(f"checkpoint at page {pages_so_far}/{total}")
+    def __init__(self, pages_so_far: int, max_page: int, total: int,
+                 captured_dir: str, captured_by_url: dict, page_title: str):
+        super().__init__(f"checkpoint at page {max_page}/{total}")
         self.pages_so_far = pages_so_far
+        self.max_page = max_page
         self.total = total
         self.captured_dir = captured_dir
         self.captured_by_url = captured_by_url
@@ -680,15 +683,23 @@ def _capture_view_document(context, file_id: str, progress=None, start_after_pag
             after = page.evaluate(_SCROLL_POS_JS)
             step_i += 1
             # memory-wall trigger: fire the checkpoint the moment we cross
-            # 40 captured pages and the viewer says more exist. Waiting for
-            # the walk's natural bottom OOMs first (verified 4x).
+            # 40 captured pages while the document is NOT scrolled to the
+            # bottom (more pages remain below). The viewer's page counter
+            # proved unreliable (pagesTotal=null in every probe), so the
+            # scroll position is the "more exist" signal. Waiting for the
+            # walk's natural bottom OOMs first (verified 6x).
             have_now = _captured_page_nums()
             if len(have_now) >= 40:
-                tp_now = _total_pages_from_viewer()
-                if tp_now and len(have_now) < tp_now:
+                info_now = page.evaluate(_SCROLL_INFO_JS)
+                sh = info_now.get("scrollHeight") or 0
+                st = info_now.get("scrollTop") or 0
+                ch = info_now.get("clientHeight") or 0
+                not_at_bottom = sh and (st + ch) < (sh - 300)
+                if not_at_bottom:
                     raise CheckpointReached(
                         pages_so_far=len(have_now),
-                        total=tp_now,
+                        max_page=max(have_now) if have_now else len(have_now),
+                        total=info_now.get("totalPages") or (max(have_now) + 1 if have_now else 41),
                         captured_dir=captured_dir,
                         captured_by_url=captured_by_url,
                         page_title=page_title,
@@ -737,6 +748,7 @@ def _capture_view_document(context, file_id: str, progress=None, start_after_pag
         if total_pages_now and pages_so_far >= 40 and pages_so_far < total_pages_now:
             raise CheckpointReached(
                 pages_so_far=pages_so_far,
+                max_page=max(_captured_page_nums()) if _captured_page_nums() else pages_so_far,
                 total=total_pages_now,
                 captured_dir=captured_dir,
                 captured_by_url=captured_by_url,
@@ -765,6 +777,8 @@ def _capture_view_document(context, file_id: str, progress=None, start_after_pag
 
         page.wait_for_timeout(3000)  # in-flight images
         _emit("finalize")
+    except CheckpointReached:
+        raise  # caller owns captured_dir — cleanup would destroy the part
     except BaseException:
         # failure path: capture owns its tempdir cleanup
         shutil.rmtree(captured_dir, ignore_errors=True)

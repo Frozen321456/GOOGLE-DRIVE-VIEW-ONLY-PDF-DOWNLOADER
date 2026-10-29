@@ -114,6 +114,9 @@ def _run_continuation(job_id: str, file_id: str, after_page: int) -> None:
             pdf_bytes, file_name = build_pdf(
                 file_id, progress=on_progress, start_after_page=after_page
             )
+            # NOTE: start_after_page is the absolute page number to resume
+            # AFTER; _run_continuation receives afterPage=cp.max_page from
+            # the chain step, so first captured page is max_page+1. ✔
         except CheckpointReached as cp:
             from downloader import _assemble_pdf_from_images
             try:
@@ -123,7 +126,7 @@ def _run_continuation(job_id: str, file_id: str, after_page: int) -> None:
             finally:
                 import shutil
                 shutil.rmtree(cp.captured_dir, ignore_errors=True)
-            lo, hi = after_page + 1, cp.pages_so_far
+            lo, hi = after_page + 1, cp.max_page
             part_name = _cont_name(file_id, lo, hi)
             job.update(status="completed", fileName=part_name,
                        size=len(part_bytes), result=part_bytes,
@@ -133,7 +136,7 @@ def _run_continuation(job_id: str, file_id: str, after_page: int) -> None:
                                   "nextFileId": file_id})
             set_status(file_id, "processing", jobId=job_id,
                        partDone=f"{lo}-{hi}")
-            if cp.pages_so_far < cp.total:
+            if cp.max_page < cp.total:
                 # still more → chain another continuation
                 def _chain2():
                     time.sleep(3)
@@ -213,7 +216,7 @@ def _run_job(job_id: str, file_id: str) -> None:
             finally:
                 import shutil
                 shutil.rmtree(cp.captured_dir, ignore_errors=True)
-            part_name = _checkpoint_name(cp.page_title, cp.pages_so_far)
+            part_name = _checkpoint_name(cp.page_title, cp.max_page)
             job.update(
                 status="completed",
                 fileName=part_name,
