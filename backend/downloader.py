@@ -667,6 +667,8 @@ def _capture_view_document(context, file_id: str, progress=None, start_after_pag
         # Steps are ~0.5 viewport so no page is skipped; after reaching the
         # bottom we compare the captured page numbers against the viewer's
         # own page count and re-scroll to any missing pages.
+        page.set_default_timeout(15000)  # no evaluate() may hang the walk
+
         stable = 0
         last_emit = 0.0
         step_i = 0
@@ -677,10 +679,16 @@ def _capture_view_document(context, file_id: str, progress=None, start_after_pag
                     "RENDER_FAILED",
                     500,
                 )
-            before = page.evaluate(_SCROLL_POS_JS)
+            try:
+                before = page.evaluate(_SCROLL_POS_JS)
+            except Exception:
+                break  # page navigated/crashed — stop the walk
             page.evaluate(_SCROLL_STEP_JS)
-            page.wait_for_timeout(900)
-            after = page.evaluate(_SCROLL_POS_JS)
+            page.wait_for_timeout(700)
+            try:
+                after = page.evaluate(_SCROLL_POS_JS)
+            except Exception:
+                break
             step_i += 1
             # memory-wall trigger: fire the checkpoint the moment we cross
             # 40 captured pages while the document is NOT scrolled to the
@@ -689,12 +697,15 @@ def _capture_view_document(context, file_id: str, progress=None, start_after_pag
             # scroll position is the "more exist" signal. Waiting for the
             # walk's natural bottom OOMs first (verified 6x).
             have_now = _captured_page_nums()
-            if len(have_now) >= 40:
-                info_now = page.evaluate(_SCROLL_INFO_JS)
+            if len(have_now) >= 36:
+                try:
+                    info_now = page.evaluate(_SCROLL_INFO_JS)
+                except Exception:
+                    info_now = {}
                 sh = info_now.get("scrollHeight") or 0
                 st = info_now.get("scrollTop") or 0
                 ch = info_now.get("clientHeight") or 0
-                not_at_bottom = sh and (st + ch) < (sh - 300)
+                not_at_bottom = bool(sh) and (st + ch) < (sh - 300)
                 if not_at_bottom:
                     raise CheckpointReached(
                         pages_so_far=len(have_now),
