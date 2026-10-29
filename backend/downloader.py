@@ -491,26 +491,11 @@ def _capture_view_document(context, file_id: str, progress=None, start_after_pag
     disk_used = {"n": 0}
     captured_dir = tempfile.mkdtemp(prefix="cap_")
 
-    # Cap page-image width at the network layer: w3200 bitmaps are what
-    # kills the 512MB renderer. 2000px keeps 242 DPI (print-quality) at
-    # ~22MB decoded per page instead of ~56MB.
-    def _route_rewrite(route):
-        try:
-            rewritten = _cap_image_width(route.request.url, cap=2000)
-            if rewritten:
-                route.continue_(url=rewritten)
-                return
-        except Exception:
-            pass
-        try:
-            route.continue_()
-        except Exception:
-            pass
-
-    try:
-        page.route("**/*", _route_rewrite)
-    except Exception:
-        pass  # interception unavailable → fall back to old behavior
+    # NOTE: route-based image-width capping was removed — under sync
+    # Playwright, page.route('**/*') + page.evaluate share one event loop,
+    # and interception starves evaluate() until the walk freezes (observed
+    # twice: frozen at 39 and 36 pages, no OOM, no timeout). Memory is
+    # handled by the on_response downscale + disk spill + checkpoint.
 
     def on_response(response):
         try:
